@@ -2,15 +2,27 @@
 # Code partially sourced from Hugging Face TRL
 
 # fmt: off
-# apply patch before importing trl, which may internally reference GuidedDecodingParams
+# apply patches before importing trl, which may internally reference vllm modules
 try:
     import vllm
+    import vllm.utils
+    
+    # Patch 1: GuidedDecodingParams was renamed to StructuredOutputsParams
     try:
         from vllm.sampling_params import GuidedDecodingParams
     except ImportError:
         import vllm.sampling_params
         # removed in https://github.com/vllm-project/vllm/pull/22772
         vllm.sampling_params.GuidedDecodingParams = vllm.sampling_params.StructuredOutputsParams
+    
+    # Patch 2: get_open_port was moved from vllm.utils to vllm.utils.network_utils
+    # trl.scripts.vllm_serve imports from the old location, so we patch it
+    if not hasattr(vllm.utils, 'get_open_port'):
+        try:
+            from vllm.utils.network_utils import get_open_port
+            vllm.utils.get_open_port = get_open_port
+        except ImportError:
+            pass
 except ImportError:
     pass
 # fmt: on

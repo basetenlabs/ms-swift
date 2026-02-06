@@ -224,34 +224,22 @@ class VLLMClient:
         dtype = str(weights.dtype)
         shape = tuple(weights.shape)
 
-        errors = [None] * self.num_servers
+        # Run in main thread to avoid CUDA context issues with ThreadPoolExecutor
+        for i in range(self.num_servers):
+            response = self.sessions[i].post(
+                f'{self.base_urls[i]}/update_named_param/',
+                json={
+                    'name': name,
+                    'dtype': dtype,
+                    'shape': shape
+                },
+            )
+            if response.status_code != 200:
+                raise Exception(f'Server {i} update failed: {response.text}')
 
-        def _update_single_server(i):
-            try:
-                response = self.sessions[i].post(
-                    f'{self.base_urls[i]}/update_named_param/',
-                    json={
-                        'name': name,
-                        'dtype': dtype,
-                        'shape': shape
-                    },
-                )
-                if response.status_code != 200:
-                    raise Exception(f'Server {i} update failed: {response.text}')
-
-                self.pynccl_comms[i].broadcast(weights, src=self.pynccl_comms[i].rank)
-                self.pynccl_comms[i].group.barrier()
-            except Exception as e:
-                errors[i] = e
-
-        with ThreadPoolExecutor(max_workers=self.num_servers) as executor:
-            futures = [executor.submit(_update_single_server, i) for i in range(self.num_servers)]
-            for future in futures:
-                future.result()
-
-        all_errors = [e for e in errors if e is not None]
-        if all_errors:
-            raise RuntimeError(f'Multiple errors: {all_errors}')
+            torch.cuda.set_device(self.pynccl_comms[i].device)
+            self.pynccl_comms[i].broadcast(weights, src=self.pynccl_comms[i].rank)
+            self.pynccl_comms[i].group.barrier()
 
     def update_adapter_flattened_param(self, peft_config, metadatas, flattened_tensor):
         """
@@ -365,35 +353,27 @@ class VLLMClient:
             metadatas: List of FlattenedTensorMetadata objects
             flattened_tensor: The flattened tensor containing all parameters
         """
-        errors = [None] * self.num_servers
         metadatas = [m.model_dump() if hasattr(m, 'model_dump') else m.dict() for m in metadatas]
 
-        def _update_single_server(i):
-            try:
-                data = {
-                    'metadatas': metadatas,
-                }
+        # Run in main thread to avoid CUDA context issues with ThreadPoolExecutor.
+        # CUDA handles (streams/events) in PyNcclCommunicator are bound to the
+        # creating thread's context; using them from a thread pool causes
+        # "invalid resource handle" errors on multi-node setups.
+        for i in range(self.num_servers):
+            data = {
+                'metadatas': metadatas,
+            }
 
-                response = self.sessions[i].post(
-                    f'{self.base_urls[i]}/update_flattened_params/',
-                    json=data,
-                )
-                if response.status_code != 200:
-                    raise Exception(f'Server {i} update flattened params failed: {response.text}')
+            response = self.sessions[i].post(
+                f'{self.base_urls[i]}/update_flattened_params/',
+                json=data,
+            )
+            if response.status_code != 200:
+                raise Exception(f'Server {i} update flattened params failed: {response.text}')
 
-                self.pynccl_comms[i].broadcast(flattened_tensor, src=self.pynccl_comms[i].rank)
-                self.pynccl_comms[i].group.barrier()
-            except Exception as e:
-                errors[i] = e
-
-        with ThreadPoolExecutor(max_workers=self.num_servers) as executor:
-            futures = [executor.submit(_update_single_server, i) for i in range(self.num_servers)]
-            for future in futures:
-                future.result()
-
-        all_errors = [e for e in errors if e is not None]
-        if all_errors:
-            raise RuntimeError(f'Multiple errors: {all_errors}')
+            torch.cuda.set_device(self.pynccl_comms[i].device)
+            self.pynccl_comms[i].broadcast(flattened_tensor, src=self.pynccl_comms[i].rank)
+            self.pynccl_comms[i].group.barrier()
 
     def update_model_params(self, model: nn.Module):
         for name, param in model.named_parameters():
