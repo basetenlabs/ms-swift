@@ -620,12 +620,12 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                     param = param.full_tensor()
                 raw_state_dict[name] = param
         else:
-            # DeepSpeed: use named_parameters + param.data
-            # No clone needed: unmerge happens after _load_state_dict_to_vllm completes
-            for name, param in self.model.named_parameters():
+            # DeepSpeed: use state_dict() to get ALL parameters
+            # This is critical for LoRA training where base model params are frozen but still need syncing
+            for name, param in self.model.state_dict().items():
                 if parameter_group and name not in parameter_group:
                     continue
-                raw_state_dict[name] = param.data
+                raw_state_dict[name] = param  # No .data needed - state_dict() already returns tensors
 
         # Process: clean names, filter adapters (keep LoRA for FSDP2 to merge at tensor level)
         state_dict = self._process_state_dict_for_vllm(
