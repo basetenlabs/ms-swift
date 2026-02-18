@@ -97,6 +97,11 @@ def _compute_default_rope_parameters(
 if transformers_5:
     EXTENDED_ROPE_INIT_FUNCTIONS['default'] = _compute_default_rope_parameters
 
+# Eagerly patch ROPE_INIT_FUNCTIONS so that HuggingFace remote model code (e.g. modeling_minimax_m2.py)
+# can look up 'default' before get_rope_inv_freq() is ever called.
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS as _ROPE_INIT_FUNCTIONS
+_ROPE_INIT_FUNCTIONS.update(EXTENDED_ROPE_INIT_FUNCTIONS)
+
 
 def _get_rope_type(rope_scaling: Optional[Dict[str, Any]]):
     if rope_scaling is None:
