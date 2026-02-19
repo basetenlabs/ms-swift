@@ -165,6 +165,13 @@ class MegatronModelConfig(TransformerConfig):
     qk_head_dim: int = 128
     qk_pos_emb_head_dim: int = 64
     v_head_dim: int = 128
+    rope_type: str = 'rope'
+    rotary_scaling_factor: float = 40
+    beta_fast: float = 32
+    beta_slow: float = 1
+    mscale: float = 1.0
+    mscale_all_dim: float = 0.0
+    cache_mla_latents: bool = False
 
     # qwen3_next
     linear_num_value_heads: Optional[int] = None

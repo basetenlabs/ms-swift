@@ -67,13 +67,13 @@ class GPTModel(McoreGPTModel):
         vocab_size = math.ceil(
             config.padded_vocab_size / config.tensor_model_parallel_size) * config.tensor_model_parallel_size
         hf_rope_scaling = config.rope_scaling
-        if config.multi_latent_attention and config.rope_type == 'yarn':
-            config.rope_type = 'rope'  # use transformers implementation
-            if hf_rope_scaling and hf_rope_scaling['rope_type'] == 'yarn':
-                # softmax_scale
-                config.mscale = hf_rope_scaling['mscale']
-                config.mscale_all_dim = hf_rope_scaling['mscale_all_dim']
-                config.rotary_scaling_factor = hf_rope_scaling['factor']
+        rope_type = (hf_rope_scaling or {}).get('rope_type')
+        if config.multi_latent_attention and rope_type == 'yarn':
+            hf_rope_scaling['rope_type'] = 'rope'  # use transformers implementation
+            # softmax_scale
+            config.mscale = hf_rope_scaling.get('mscale', config.mscale)
+            config.mscale_all_dim = hf_rope_scaling.get('mscale_all_dim', config.mscale_all_dim)
+            config.rotary_scaling_factor = hf_rope_scaling.get('factor', config.rotary_scaling_factor)
         self.hf_rope_scaling = hf_rope_scaling
         if mcore_013:
             kwargs = {'vp_stage': vp_stage}
