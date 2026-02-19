@@ -82,7 +82,7 @@ class MegatronModelLoader:
 
     def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
         if self.config.num_moe_experts:
-            kwargs = {'qk_l2_norm': self.config.qk_l2_norm, 'vp_stage': vp_stage} if self.mcore_013 else {}
+            kwargs = {'qk_l2_norm': self.config.qk_l2_norm or False, 'vp_stage': vp_stage} if self.mcore_013 else {}
             transformer_layer_spec = get_gpt_decoder_block_spec(
                 self.config, use_transformer_engine=True, normalization=self.config.normalization, **kwargs)
         else:
@@ -91,7 +91,7 @@ class MegatronModelLoader:
 
     def _get_transformer_layer_spec(self):
         config = self.config
-        kwargs = {'qk_l2_norm': config.qk_l2_norm} if self.mcore_013 else {}
+        kwargs = {'qk_l2_norm': config.qk_l2_norm or False} if self.mcore_013 else {}
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             config.num_moe_experts,
             self.args.moe_grouped_gemm,
