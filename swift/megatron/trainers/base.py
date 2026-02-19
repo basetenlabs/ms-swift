@@ -98,7 +98,10 @@ class BaseMegatronTrainer(ABC):
             getattr(callback, event)(**kwargs)
 
     def on_log(self, logs, prefix=''):
-        n_steps = logs.pop('n_steps')
+        # we do this because aggregated_metrics populates n_steps, but is only called on the last pp rank
+        # this is a workaround to ensure this line doesn't blow up on non-last pp ranks
+        # the structure here leaves a lot to be desired, but I'm just doing the smallest possible fix for now
+        n_steps = logs.pop('n_steps', 1)
         self._log_callback(logs, n_steps)
         if prefix:
             logs = {f'{prefix}{k}': v for k, v in logs.items()}
@@ -515,6 +518,8 @@ class BaseMegatronTrainer(ABC):
                     train_metrics['learning_rate'] = learning_rate
             if state.should_log:
                 state.should_log = False
+                # All ranks must call on_log so they participate in MoE aux loss
+                # collective reductions (all-reduce across PP and DP groups).
                 self.on_log(logs=train_metrics)
                 train_metrics = {}
 
@@ -643,7 +648,9 @@ class BaseMegatronTrainer(ABC):
         )
 
         _, grad_norm, _ = self.optimizer.step()
+
         grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
+
         self.opt_param_scheduler.step(increment=args.global_batch_size)
 
         return metrics, grad_norm
