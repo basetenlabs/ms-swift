@@ -111,6 +111,7 @@ register_model(
                 Model('moonshotai/Kimi-K2-Instruct', 'moonshotai/Kimi-K2-Instruct'),
                 Model('moonshotai/Kimi-K2-Instruct-0905', 'moonshotai/Kimi-K2-Instruct-0905'),
                 Model('moonshotai/Kimi-K2-Thinking', 'moonshotai/Kimi-K2-Thinking'),
+                Model('moonshotai/Kimi-K2.5', 'moonshotai/Kimi-K2.5'),
             ], TemplateType.kimi_k2),
             ModelGroup([
                 Model('deepseek-ai/DeepSeek-V3.1-Base', 'deepseek-ai/DeepSeek-V3.1-Base'),
