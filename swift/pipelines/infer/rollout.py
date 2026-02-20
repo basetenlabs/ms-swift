@@ -35,11 +35,11 @@ import time
 import traceback
 from collections.abc import Sequence
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from itertools import chain
 from multiprocessing import Pipe, Process
 from multiprocessing.connection import Connection
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 import uvicorn
@@ -49,8 +49,8 @@ from trl.scripts.vllm_serve import WeightSyncWorkerExtension as HFWeightSyncWork
 
 from swift.arguments import RolloutArguments
 from swift.infer_engine import GRPOVllmEngine, InferClient
-from swift.infer_engine.protocol import (InitCommunicatorRequest, RequestConfig, RolloutInferRequest,
-                                         UpdateWeightsRequest)
+from swift.infer_engine.protocol import (ChatCompletionRequest, InitCommunicatorRequest, Model, ModelList,
+                                         RequestConfig, RolloutInferRequest, UpdateWeightsRequest)
 from swift.rlhf_trainers.utils import (FlattenedTensorBucket, FlattenedTensorMetadata, TensorLoRARequest,
                                        UpdateAdapterRequest, UpdateFlattenedAdapterRequest,
                                        UpdateFlattenedParamsRequest, check_vllm_version_ge, patch_vllm_load_adapter,
@@ -332,6 +332,8 @@ class SwiftRolloutDeploy(SwiftPipeline):
 
     def _register_rl_rollout_app(self):
         self.app.get('/health/')(self.health)
+        self.app.get('/v1/models')(self.openai_models)
+        self.app.post('/v1/chat/completions')(self.openai_chat_completions)
         self.app.get('/get_world_size/')(self.get_world_size)
         self.app.post('/init_communicator/')(self.init_communicator)
         self.app.post('/update_named_param/')(self.update_named_param)
@@ -355,6 +357,47 @@ class SwiftRolloutDeploy(SwiftPipeline):
         self.connections = []
         self.processes = []
         self._start_data_parallel_workers()
+
+    @staticmethod
+    def _to_jsonable(value: Any):
+        if hasattr(value, 'model_dump'):
+            return value.model_dump()
+        if is_dataclass(value):
+            return asdict(value)
+        if isinstance(value, list):
+            return [SwiftRolloutDeploy._to_jsonable(item) for item in value]
+        if isinstance(value, dict):
+            return {k: SwiftRolloutDeploy._to_jsonable(v) for k, v in value.items()}
+        return value
+
+    async def openai_models(self):
+        model_name = self.args.model.split('/')[-1]
+        return self._to_jsonable(ModelList(data=[Model(id=model_name)]))
+
+    async def openai_chat_completions(self, request: Dict[str, Any]):
+        import inspect
+        valid_keys = set(inspect.signature(ChatCompletionRequest.__init__).parameters.keys()) - {'self'}
+        filtered = {k: v for k, v in request.items() if k in valid_keys}
+        chat_request = ChatCompletionRequest(**filtered)
+        infer_request, request_config = chat_request.parse()
+        rollout_request = RolloutInferRequest(
+            messages=infer_request.messages,
+            images=infer_request.images,
+            audios=infer_request.audios,
+            videos=infer_request.videos,
+            tools=infer_request.tools,
+            objects=infer_request.objects,
+        )
+        outputs = await self.infer([rollout_request], request_config=request_config)
+        if not outputs:
+            raise RuntimeError('Rollout server returned empty response for chat completion request.')
+
+        output = outputs[0]
+        if isinstance(output, dict):
+            response = output.get('response', output)
+        else:
+            response = getattr(output, 'response', output)
+        return self._to_jsonable(response)
 
     def _start_data_parallel_workers(self):
         for data_parallel_rank in range(self.num_connections):
