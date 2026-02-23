@@ -376,10 +376,77 @@ class SwiftRolloutDeploy(SwiftPipeline):
 
     async def openai_chat_completions(self, request: Dict[str, Any]):
         import inspect
+        import json as _json
+        import time as _time
+
+        _log_path = '/root/.cache/user_artifacts/chat_completions_log.jsonl'
+        _req_ts = _time.time()
+
+        n_msgs = len(request.get('messages', []))
+        msg_roles = [m.get('role', '?') for m in request.get('messages', [])]
+        tools = request.get('tools', [])
+        n_tools = len(tools) if isinstance(tools, list) else 0
+        all_keys = sorted(request.keys())
+
+        print(f'[chat_completions] request: n_msgs={n_msgs} roles={msg_roles} '
+              f'n_tools={n_tools} all_keys={all_keys} '
+              f'model={request.get("model")} stream={request.get("stream")} '
+              f'temperature={request.get("temperature")} max_tokens={request.get("max_tokens")}',
+              flush=True)
+
+        # Log FULL message contents to stdout for debugging tool calling
+        for idx, msg in enumerate(request.get('messages', [])):
+            role = msg.get('role', '?')
+            content = msg.get('content', '')
+            if isinstance(content, list):
+                content = str(content)
+            print(f'[chat_completions] msg[{idx}] role={role} len={len(str(content))} content:\n{content}',
+                  flush=True)
+        if n_tools > 0:
+            tool_names = [t.get('function', {}).get('name', '?') for t in tools if isinstance(t, dict)]
+            print(f'[chat_completions] tool_names={tool_names}', flush=True)
+
+        # Log the FULL request (messages + tools + response) to a local file
+        try:
+            log_record = {
+                'type': 'request',
+                'ts': _req_ts,
+                'all_keys': all_keys,
+                'model': request.get('model'),
+                'stream': request.get('stream'),
+                'temperature': request.get('temperature'),
+                'max_tokens': request.get('max_tokens'),
+                'n_msgs': n_msgs,
+                'n_tools': n_tools,
+                'messages': request.get('messages', []),
+                'tools': tools if tools else None,
+                'tool_choice': request.get('tool_choice'),
+            }
+            with open(_log_path, 'a') as f:
+                f.write(_json.dumps(log_record, default=str) + '\n')
+        except Exception as _e:
+            print(f'[chat_completions] log write error: {_e}', flush=True)
+
+        # Normalize message content: Lovable sends content as a list of
+        # content blocks (e.g. [{"type":"text","text":"..."}]). The infer
+        # engine expects plain strings.
+        for msg in request.get('messages', []):
+            c = msg.get('content')
+            if isinstance(c, list):
+                parts = []
+                for block in c:
+                    if isinstance(block, dict) and block.get('type') == 'text':
+                        parts.append(block.get('text', ''))
+                    elif isinstance(block, str):
+                        parts.append(block)
+                msg['content'] = '\n'.join(parts)
+
         valid_keys = set(inspect.signature(ChatCompletionRequest.__init__).parameters.keys()) - {'self'}
         filtered = {k: v for k, v in request.items() if k in valid_keys}
+        filtered['stream'] = False
         chat_request = ChatCompletionRequest(**filtered)
         infer_request, request_config = chat_request.parse()
+        request_config.stream = False
         rollout_request = RolloutInferRequest(
             messages=infer_request.messages,
             images=infer_request.images,
@@ -397,7 +464,38 @@ class SwiftRolloutDeploy(SwiftPipeline):
             response = output.get('response', output)
         else:
             response = getattr(output, 'response', output)
-        return self._to_jsonable(response)
+        response_json = self._to_jsonable(response)
+
+        # Log the full response
+        try:
+            resp_record = {
+                'type': 'response',
+                'ts': _time.time(),
+                'req_ts': _req_ts,
+                'latency_s': _time.time() - _req_ts,
+                'response': response_json,
+            }
+            with open(_log_path, 'a') as f:
+                f.write(_json.dumps(resp_record, default=str) + '\n')
+
+            choices = response_json.get('choices', []) if isinstance(response_json, dict) else []
+            for i, c in enumerate(choices):
+                msg = c.get('message', {})
+                content = msg.get('content') or ''
+                tool_calls = msg.get('tool_calls', [])
+                finish = c.get('finish_reason', '?')
+                n_tc = len(tool_calls) if tool_calls else 0
+                print(f'[chat_completions] response choice[{i}]: finish={finish} '
+                      f'n_tool_calls={n_tc}',
+                      flush=True)
+                print(f'[chat_completions] FULL response content:\n{content}', flush=True)
+                if tool_calls:
+                    print(f'[chat_completions] tool_calls: {_json.dumps(tool_calls, default=str)}',
+                          flush=True)
+        except Exception as _e:
+            print(f'[chat_completions] response log error: {_e}', flush=True)
+
+        return response_json
 
     def _start_data_parallel_workers(self):
         for data_parallel_rank in range(self.num_connections):
@@ -664,6 +762,10 @@ class SwiftRolloutDeploy(SwiftPipeline):
         all_outputs = [connection.recv() for connection in self.connections]
         # Handle empty prompts (see above)
         all_outputs = [output for output, requests in zip(all_outputs, chunked_infer_requests) if requests]
+        # Guard against None from workers that encountered errors
+        all_outputs = [output for output in all_outputs if output is not None]
+        if not all_outputs:
+            return None
         all_outputs = list(chain.from_iterable(all_outputs))  # from list of list to single list
 
         return all_outputs
