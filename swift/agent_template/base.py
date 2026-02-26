@@ -90,7 +90,10 @@ class ReactCompatMixin:
             Tuple of (formatted assistant content, formatted tool responses).
         """
         assert len(tool_messages) > 0
-        with_action = self.keyword.action in assistant_content and self.keyword.action_input in assistant_content
+        if assistant_content is None:
+            assistant_content = ''
+        with_action = (self.keyword.action in assistant_content
+                       and self.keyword.action_input in assistant_content)
         if with_action:
             if not assistant_content.endswith(self.keyword.observation):
                 if not assistant_content.endswith('\n'):

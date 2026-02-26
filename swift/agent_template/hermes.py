@@ -38,7 +38,10 @@ class HermesAgentTemplate(BaseAgentTemplate):
         assistant_content: str,
         tool_messages,
     ) -> Tuple[str, 'Prompt']:
-        with_action = self.keyword.action in assistant_content and self.keyword.action_input in assistant_content
+        if assistant_content is None:
+            assistant_content = ''
+        with_action = (self.keyword.action in assistant_content
+                       and self.keyword.action_input in assistant_content)
         if with_action:
             return super()._format_tool_responses(assistant_content, tool_messages)
         if hasattr(self, 'template_meta'):
