@@ -106,7 +106,7 @@ class StdTemplateInputs:
         res = {'images': [], 'audios': [], 'videos': []}
         for message in messages:
             content = message['content']
-            if isinstance(content, str):
+            if content is None or isinstance(content, str):
                 continue
             elif (isinstance(content, list) and content
                   and isinstance(content[0], int)) or (isinstance(content, dict) and 'token_ids' in content):
