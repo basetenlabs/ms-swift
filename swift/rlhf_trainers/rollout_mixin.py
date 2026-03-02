@@ -617,12 +617,12 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                     param = param.full_tensor()
                 raw_state_dict[name] = param
         else:
-            # DeepSpeed: use named_parameters + param.data
-            # No clone needed: unmerge happens after _load_state_dict_to_vllm completes
-            for name, param in self.model.named_parameters():
+            # DeepSpeed: use state_dict() to get ALL parameters
+            # This is critical for LoRA training where base model params are frozen but still need syncing
+            for name, param in self.model.state_dict().items():
                 if parameter_group and name not in parameter_group:
                     continue
-                raw_state_dict[name] = param.data
+                raw_state_dict[name] = param  # No .data needed - state_dict() already returns tensors
 
         # Process: clean names, filter adapters (keep LoRA for FSDP2 to merge at tensor level)
         state_dict = self._process_state_dict_for_vllm(
@@ -646,34 +646,31 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
     def _move_full_model_to_vllm(self):
         """Transfer full model weights to vLLM engine.
 
-        Manages the lifecycle of gather and merge/unmerge per parameter_group:
-        - gather_if_zero3: per parameter_group batch (DeepSpeed Zero3)
+        Manages the lifecycle of gather and merge/unmerge:
+        - gather_if_zero3: once for the entire sync (DeepSpeed Zero3)
         - merge/unmerge: per parameter_group (must be within gather context)
         - No clone needed: unmerge happens after load completes
         """
         is_peft = is_peft_model(self.model)
+        # For DeepSpeed, merge within gather context; FSDP2 uses tensor-level merge
         should_merge = is_peft and not self._is_fsdp2
 
         gather_if_zero3 = get_gather_if_zero3_context(self)
+        parameters = [] if self._is_fsdp2 else list(self.model.parameters())
 
-        for i, parameter_group in enumerate(self.parameter_groups):
-            parameter_group_no_lora = self.parameter_groups_no_lora[i]
+        with gather_if_zero3(parameters):
+            for i, parameter_group in enumerate(self.parameter_groups):
+                parameter_group_no_lora = self.parameter_groups_no_lora[i]
 
-            if not self._is_fsdp2:
-                parameters = [
-                    parameter for name, parameter in self.model.named_parameters()
-                    if not parameter_group or name in parameter_group
-                ]
-            else:
-                parameters = []
-
-            with gather_if_zero3(parameters):
+                # Merge must be within gather context (needs full parameters)
                 if should_merge:
                     with patch_lora_merge(self.model, parameter_group):
                         self.model.merge_adapter()
 
                 try:
+                    # Collect without clone - unmerge happens after load
                     state_dict = self._collect_state_dict_for_vllm(parameter_group, parameter_group_no_lora)
+                    # Data is copied here (FlattenedTensorBucket.copy_ or vLLM load_weights)
                     self._load_state_dict_to_vllm(state_dict)
                 finally:
                     if should_merge:
