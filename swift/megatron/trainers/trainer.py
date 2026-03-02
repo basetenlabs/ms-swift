@@ -80,7 +80,7 @@ class MegatronTrainer(BaseMegatronTrainer):
             lm_loss = lm_loss.clone()
         local_num_tokens = loss[1].detach().clone().to(torch.int)
         metrics = {'loss': reporting_loss}
-        if args.enable_channel_loss:
+        if args.enable_channel_loss and channels is not None:
             metrics.update(self._compute_channel_loss(losses, loss_mask, channels, packed_seq_params))
         return (lm_loss, local_num_tokens, metrics)
 
