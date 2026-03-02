@@ -24,6 +24,8 @@ class WandbCallback(MegatronCallback):
         if is_last_rank():
             wandb.init(dir=self.save_dir, name=args.wandb_exp_name, project=args.wandb_project, config=self.config)
             self.writer = wandb
+            if wandb.run is not None and getattr(wandb.run, "url", None):
+                print(f'wandb_url: {wandb.run.url}', flush=True)
 
     def on_log(self, logs):
         logs = rewrite_logs(logs)
