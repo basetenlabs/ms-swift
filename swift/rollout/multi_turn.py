@@ -753,6 +753,8 @@ class GYMScheduler(RolloutScheduler):
             done = False
             total_reward = 0.0
             step_rewards = []
+            total_response_ids: List[List[int]] = []
+            total_response_loss_mask: List[List[int]] = []
             trajectory_id = infer_request.uuid
             trajectory_info = [info]
 
@@ -767,6 +769,12 @@ class GYMScheduler(RolloutScheduler):
                 response_choice: 'ChatCompletionResponseChoice' = response.choices[0]
                 completion = response_choice.message.content
                 messages.append({'role': 'assistant', 'content': completion})
+
+                # Store raw token IDs from vLLM to avoid re-tokenization during training
+                if response_choice.token_ids:
+                    turn_token_ids = list(response_choice.token_ids)
+                    total_response_ids.append(turn_token_ids)
+                    total_response_loss_mask.append([1] * len(turn_token_ids))
 
                 # Execute environment step
                 next_obs, reward, done, step_info = await env.step(deepcopy(messages))
@@ -785,6 +793,8 @@ class GYMScheduler(RolloutScheduler):
             return RolloutOutput(
                 response=response,
                 messages=messages,
+                response_token_ids=total_response_ids,
+                response_loss_mask=total_response_loss_mask,
                 rollout_infos={
                     'num_turns': current_turn,
                     'trajectory_id': trajectory_id,

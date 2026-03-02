@@ -2,60 +2,66 @@
 # Code partially sourced from Hugging Face TRL
 
 # fmt: off
-# apply patch before importing trl, which may internally reference GuidedDecodingParams
+# apply patches before importing trl, which may internally reference vllm modules
 try:
     import vllm
+    import vllm.utils
+
+    # Patch 1: GuidedDecodingParams was renamed to StructuredOutputsParams
     try:
         from vllm.sampling_params import GuidedDecodingParams
     except ImportError:
         import vllm.sampling_params
-
         # removed in https://github.com/vllm-project/vllm/pull/22772
         vllm.sampling_params.GuidedDecodingParams = vllm.sampling_params.StructuredOutputsParams
+
+    # Patch 2: get_open_port was moved from vllm.utils to vllm.utils.network_utils
+    # trl.scripts.vllm_serve imports from the old location, so we patch it
+    if not hasattr(vllm.utils, 'get_open_port'):
+        try:
+            from vllm.utils.network_utils import get_open_port
+            vllm.utils.get_open_port = get_open_port
+        except ImportError:
+            pass
 except ImportError:
     pass
 # fmt: on
+
 import asyncio
 import inspect
 import multiprocessing
 import os
 import time
-import torch
-import torch.distributed.distributed_c10d as c10d
 import traceback
-import uvicorn
-from aiohttp import ClientConnectorError
 from collections.abc import Sequence
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import asdict
-from fastapi import FastAPI
+from dataclasses import asdict, is_dataclass
 from itertools import chain
 from multiprocessing import Pipe, Process
 from multiprocessing.connection import Connection
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
+
+import torch
+import uvicorn
+from aiohttp import ClientConnectorError
+from fastapi import FastAPI
+from trl.scripts.vllm_serve import WeightSyncWorkerExtension as HFWeightSyncWorkerExtension
 
 from swift.arguments import RolloutArguments
 from swift.infer_engine import GRPOVllmEngine, InferClient
-from swift.infer_engine.protocol import (InitCommunicatorRequest, RequestConfig, RolloutInferRequest,
-                                         UpdateWeightsRequest)
+from swift.infer_engine.protocol import (ChatCompletionRequest, InitCommunicatorRequest, Model, ModelList,
+                                         RequestConfig, RolloutInferRequest, UpdateWeightsRequest)
 from swift.rlhf_trainers.utils import (FlattenedTensorBucket, FlattenedTensorMetadata, TensorLoRARequest,
                                        UpdateAdapterRequest, UpdateFlattenedAdapterRequest,
-                                       UpdateFlattenedParamsRequest, check_vllm_version_ge, chunk_list,
+                                       UpdateFlattenedParamsRequest, check_vllm_version_ge,
                                        patch_vllm_load_adapter, patch_vllm_moe_model_weight_loader)
 from swift.rollout import RolloutScheduler, multi_turns
 from swift.utils import get_logger, get_seed, get_torch_device, is_vllm_ascend_available
 from ..base import SwiftPipeline
 
 try:
-    if check_vllm_version_ge('0.11.1'):
-        from vllm.utils.network_utils import get_open_port
-    else:
-        from vllm.utils import get_open_port
-    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-    from vllm.distributed.parallel_state import get_world_group
-    from vllm.distributed.utils import StatelessProcessGroup
-    if is_vllm_ascend_available():
-        from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator as PyNcclCommunicator  # noqa
+    from vllm.utils import get_open_port
+    from trl.scripts.vllm_serve import chunk_list
 
 except ImportError:
     pass
@@ -79,49 +85,7 @@ Note:
 patch_vllm_load_adapter()
 
 
-class WeightSyncWorkerExtension:
-
-    # The following attributes are initialized when `init_communicator` method is called.
-    communicator = None  # Communicator for weight updates
-    client_rank = None  # Source rank for broadcasting updated weights
-
-    def init_communicator(self, host: str, port: int, world_size: int) -> None:
-        """
-        Initializes the weight update communicator using a stateless process group.
-
-        This method creates a `StatelessProcessGroup` that allows external training processes to communicate with vLLM
-        workers without interfering with the global torch distributed group.
-
-        Args:
-            host (`str`):
-                Hostname or IP address of the master node.
-            port (`int`):
-                Port number to be used for communication.
-            world_size (`int`):
-                Total number of participating processes in the update group.
-        """
-        if self.communicator is not None:
-            raise RuntimeError('Weight update group already initialized. Call close_communicator first.')
-
-        # Get the rank of the current worker in the global world group.
-        rank = get_world_group().rank
-
-        # Create a stateless process group to manage communication between training processes and vLLM workers.
-        # Initialize the NCCL-based communicator for weight synchronization.
-        pg = StatelessProcessGroup.create(host=host, port=port, rank=rank, world_size=world_size)
-
-        if is_vllm_ascend_available():
-            # https://github.com/modelscope/ms-swift/issues/5920
-            device = get_world_group().local_rank
-            import torch_npu
-            torch_npu.npu.set_device(device)
-        else:
-            device = self.device
-
-        self.communicator = PyNcclCommunicator(pg, device=device)
-
-        # The client process that sends updated weights has the highest rank (world_size - 1).
-        self.client_rank = world_size - 1
+class WeightSyncWorkerExtension(HFWeightSyncWorkerExtension):
 
     def update_named_param(self, name: str, dtype: str, shape: Sequence[int]) -> None:
         """
@@ -135,12 +99,12 @@ class WeightSyncWorkerExtension:
             shape (`Sequence[int]`):
                 Shape of the weight tensor.
         """
-        if self.communicator is None:
+        if self._comm is None:
             raise RuntimeError('Communicator not initialized. Call `init_communicator` first.')
 
         dtype = getattr(torch, dtype.split('.')[-1])
         # Allocate memory for the incoming weight tensor on the correct device.
-        weight = torch.empty(shape, dtype=dtype, device=self.communicator.device)
+        weight = torch.empty(shape, dtype=dtype, device=self._comm.device)
 
         # Use NCCL to broadcast the updated weights from the client (src) to all workers.
         self.communicator.broadcast(
@@ -158,7 +122,7 @@ class WeightSyncWorkerExtension:
         Receives and applies a flattened LoRA adapter to the model.
         """
         metadatas = [FlattenedTensorMetadata(**metadata) for metadata in metadatas]
-        if self.communicator is None:
+        if self._comm is None:
             raise RuntimeError('Communicator not initialized. Call `init_communicator` first.')
         flatten_tensor_length = metadatas[-1].end_idx
         dtype = getattr(torch, metadatas[-1].dtype.split('.')[-1])
@@ -186,7 +150,7 @@ class WeightSyncWorkerExtension:
             peft_config: PEFT configuration dictionary.
             lora_tensors_metadata: List of metadata dictionaries for each tensor.
         """
-        if self.communicator is None:
+        if self._comm is None:
             raise RuntimeError('Communicator not initialized. Call `init_communicator` first.')
 
         # Receive each tensor individually
@@ -200,7 +164,7 @@ class WeightSyncWorkerExtension:
                 tensor, src=self.client_rank, stream=getattr(get_torch_device(), 'current_stream', lambda: None)())
             named_params[name] = tensor
 
-        self.communicator.group.barrier()
+        self._comm.group.barrier()
 
         lora_request = TensorLoRARequest(
             lora_name=f'{lora_int_id}',
@@ -218,12 +182,12 @@ class WeightSyncWorkerExtension:
             metadatas (list[Dict]): List of metadata dictionaries for the flattened tensors.
         """
         metadatas = [FlattenedTensorMetadata(**metadata) for metadata in metadatas]
-        if self.communicator is None:
+        if self._comm is None:
             raise RuntimeError('Communicator not initialized. Call `init_communicator` first.')
 
         flatten_tensor_length = metadatas[-1].end_idx
         dtype = getattr(torch, metadatas[-1].dtype.split('.')[-1])
-        flatten_tensor = torch.empty(flatten_tensor_length, dtype=dtype, device=self.communicator.device)
+        flatten_tensor = torch.empty(flatten_tensor_length, dtype=dtype, device=self._comm.device)
 
         self.communicator.broadcast(
             flatten_tensor, src=self.client_rank, stream=getattr(get_torch_device(), 'current_stream', lambda: None)())
@@ -237,17 +201,23 @@ class WeightSyncWorkerExtension:
         # Load the reconstructed parameters into the model
         self.model_runner.model.load_weights(weights=list(named_params.items()))
 
-    def close_communicator(self) -> None:
+    @property
+    def _comm(self):
         """
-        Closes the communicator when weight synchronization is no longer needed.
+        Compatibility wrapper for communicator access across TRL versions.
 
-        This method deletes the NCCL communicator to release associated resources.
+        Returns the appropriate communicator attribute based on the TRL version:
+        - trl < 0.24.0: self.pynccl_comm
+        - trl >= 0.24.0: self.communicator
         """
-
-        if self.communicator is not None:
-            del self.communicator
-            self.communicator = None  # Ensure attribute is reset to None
-            self.client_rank = None  # Ensure attribute is reset to None
+        # Try new version first
+        if hasattr(self, 'communicator'):
+            return self.communicator
+        # Fall back to old version
+        elif hasattr(self, 'pynccl_comm'):
+            return self.pynccl_comm
+        else:
+            return None
 
 
 logger = get_logger()
@@ -366,6 +336,8 @@ class SwiftRolloutDeploy(SwiftPipeline):
 
     def _register_rl_rollout_app(self):
         self.app.get('/health/')(self.health)
+        self.app.get('/v1/models')(self.openai_models)
+        self.app.post('/v1/chat/completions')(self.openai_chat_completions)
         self.app.get('/get_world_size/')(self.get_world_size)
         self.app.post('/init_communicator/')(self.init_communicator)
         self.app.post('/update_named_param/')(self.update_named_param)
@@ -419,6 +391,46 @@ class SwiftRolloutDeploy(SwiftPipeline):
                 logger.warning(f'Process {process} is still alive after 10 seconds, attempting to terminate...')
                 process.terminate()
                 process.join()  # ensure process termination after calling terminate()
+
+    @staticmethod
+    def _to_jsonable(value: Any):
+        if hasattr(value, 'model_dump'):
+            return value.model_dump()
+        if is_dataclass(value):
+            return asdict(value)
+        if isinstance(value, list):
+            return [SwiftRolloutDeploy._to_jsonable(item) for item in value]
+        if isinstance(value, dict):
+            return {k: SwiftRolloutDeploy._to_jsonable(v) for k, v in value.items()}
+        return value
+
+    async def openai_models(self):
+        model_name = self.args.model.split('/')[-1]
+        return self._to_jsonable(ModelList(data=[Model(id=model_name)]))
+
+    async def openai_chat_completions(self, request: Dict[str, Any]):
+        valid_keys = set(inspect.signature(ChatCompletionRequest.__init__).parameters.keys()) - {'self'}
+        filtered = {k: v for k, v in request.items() if k in valid_keys}
+        chat_request = ChatCompletionRequest(**filtered)
+        infer_request, request_config = chat_request.parse()
+        rollout_request = RolloutInferRequest(
+            messages=infer_request.messages,
+            images=infer_request.images,
+            audios=infer_request.audios,
+            videos=infer_request.videos,
+            tools=infer_request.tools,
+            objects=infer_request.objects,
+        )
+        outputs = await self.infer([rollout_request], request_config=request_config)
+        if not outputs:
+            raise RuntimeError('Rollout server returned empty response for chat completion request.')
+
+        output = outputs[0]
+        if isinstance(output, dict):
+            response = output.get('response', output)
+        else:
+            response = getattr(output, 'response', output)
+        return self._to_jsonable(response)
 
     @staticmethod
     def get_infer_engine(args: RolloutArguments, template=None, **kwargs):
@@ -494,7 +506,12 @@ class SwiftRolloutDeploy(SwiftPipeline):
         # The function init_communicator is called this way: init_communicator(host, port, world_size)
         # So with collective_rpc we need to call it this way:
         # llm.collective_rpc(method="init_communicator", args=(host, port, world_size))
-        kwargs = {'method': 'init_communicator', 'args': (request.host, request.port, world_size)}
+        kwargs = {
+            'method':
+            'init_communicator',
+            'args': (request.host, request.port, world_size, *(() if request.client_device_uuid is None else
+                                                               (request.client_device_uuid, )))
+        }
         for connection in self.connections:
             connection.send({'type': 'fire_and_forget', 'method': 'collective_rpc', 'kwargs': kwargs})
 
