@@ -11,7 +11,6 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.models.common.embeddings import rope_utils
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.gpt import GPTModel as McoreGPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -67,17 +66,13 @@ class GPTModel(McoreGPTModel):
         vocab_size = math.ceil(
             config.padded_vocab_size / config.tensor_model_parallel_size) * config.tensor_model_parallel_size
         hf_rope_scaling = config.rope_scaling
-        if config.multi_latent_attention:
-            config.rope_type = 'rope'  # use transformers implementation
-            # Set default value, the following content will not be used. (dummy)
-            config.mscale_all_dim = 0.
-            config.cache_mla_latents = False
-            config.rotary_scaling_factor = 40
-            if hf_rope_scaling and hf_rope_scaling['rope_type'] == 'yarn':
-                # softmax_scale
-                config.mscale = hf_rope_scaling['mscale']
-                config.mscale_all_dim = hf_rope_scaling['mscale_all_dim']
-                config.rotary_scaling_factor = hf_rope_scaling['factor']
+        rope_type = (hf_rope_scaling or {}).get('rope_type')
+        if config.multi_latent_attention and rope_type == 'yarn':
+            hf_rope_scaling['rope_type'] = 'rope'  # use transformers implementation
+            # softmax_scale
+            config.mscale = hf_rope_scaling.get('mscale', config.mscale)
+            config.mscale_all_dim = hf_rope_scaling.get('mscale_all_dim', config.mscale_all_dim)
+            config.rotary_scaling_factor = hf_rope_scaling.get('factor', config.rotary_scaling_factor)
         self.hf_rope_scaling = hf_rope_scaling
         if mcore_013:
             kwargs = {'vp_stage': vp_stage}
@@ -129,9 +124,13 @@ class GPTModel(McoreGPTModel):
         elif self.args.task_type == 'embedding' and self.post_process:
             self.output_layer = None
 
-        if self.attention_scaling != 1 and config.apply_rope_fusion:
+        if (self.attention_scaling != 1 or config.position_embedding_type == 'mrope') and config.apply_rope_fusion:
             config.apply_rope_fusion = False
-            logger.warning(f'`apply_rope_fusion` does not support `attention_scaling`. '
+            if self.attention_scaling != 1:
+                warning_string = 'attention_scaling'
+            else:
+                warning_string = 'mrope'
+            logger.warning(f'`apply_rope_fusion` does not support `{warning_string}`. '
                            f'Setting `config.apply_rope_fusion`: {config.apply_rope_fusion}')
         if self.attention_scaling != 1:
             self._patch_apply_rotary_pos_emb()
@@ -142,16 +141,15 @@ class GPTModel(McoreGPTModel):
                 attention.config.apply_rope_fusion = False
 
     def _patch_apply_rotary_pos_emb(self):
-        if hasattr(rope_utils, '_origin_apply_rotary_pos_emb_bshd'):
-            return
-        _origin_apply_rotary_pos_emb_bshd = rope_utils._apply_rotary_pos_emb_bshd
+        from megatron.core.transformer import attention
+        origin_apply_rotary_pos_emb = attention.apply_rotary_pos_emb
 
-        def _apply_rotary_pos_emb_bshd(*args, **kwargs):
+        def apply_rotary_pos_emb(*args, **kwargs):
             kwargs['mscale'] = self.attention_scaling
-            return _origin_apply_rotary_pos_emb_bshd(*args, **kwargs)
+            return origin_apply_rotary_pos_emb(*args, **kwargs)
 
-        rope_utils._apply_rotary_pos_emb_bshd = _apply_rotary_pos_emb_bshd
-        rope_utils._origin_apply_rotary_pos_emb_bshd = _origin_apply_rotary_pos_emb_bshd
+        attention.apply_rotary_pos_emb = apply_rotary_pos_emb
+        attention.origin_apply_rotary_pos_emb = origin_apply_rotary_pos_emb
 
     def _preprocess(
         self,
