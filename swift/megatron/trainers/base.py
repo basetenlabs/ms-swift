@@ -114,7 +114,9 @@ class BaseMegatronTrainer(ABC):
             getattr(callback, event)(**kwargs)
 
     def on_log(self, logs, prefix=''):
-        n_steps = logs.pop('n_steps')
+        # n_steps is populated by _aggregated_metrics which only runs on the last PP rank.
+        # Default to 1 so non-last PP ranks don't crash.
+        n_steps = logs.pop('n_steps', 1)
         self._log_callback(logs, n_steps)
         if prefix:
             logs = {f'{prefix}{k}': v for k, v in logs.items()}
@@ -636,7 +638,8 @@ class BaseMegatronTrainer(ABC):
         output_dir = os.path.join(args.output_dir, f'checkpoint-{iteration}')
         os.makedirs(output_dir, exist_ok=True)
         args_path = os.path.join(os.path.dirname(output_dir), 'args.json')
-        self.copy_path(args_path, os.path.join(output_dir, 'args.json'))
+        if os.path.exists(args_path):
+            self.copy_path(args_path, os.path.join(output_dir, 'args.json'))
         save_peft_format = args.tuner_type == 'lora' and not args.merge_lora
         if args.save_safetensors and args.no_save_optim:
             model = []
@@ -665,7 +668,8 @@ class BaseMegatronTrainer(ABC):
                 os.makedirs(output_dir, exist_ok=True)
                 for fname in ['latest_checkpointed_iteration.txt', 'args.json']:
                     src_path = os.path.join(origin_output_dir, fname)
-                    self.copy_path(src_path, os.path.join(output_dir, fname))
+                    if os.path.exists(src_path):
+                        self.copy_path(src_path, os.path.join(output_dir, fname))
                 # common.pt
                 common_path = os.path.join(origin_output_dir, f'iter_{iteration:07d}', 'common.pt')
                 tgt_common_path = os.path.join(output_dir, f'iter_{iteration:07d}', 'common.pt')
