@@ -77,11 +77,6 @@ class PrintCallback(MegatronCallback):
         if isinstance(active_tokens_per_step, (int, float)) and isinstance(total_tokens_per_step, (int, float)):
             active_tokens_per_step = float(active_tokens_per_step)
             total_tokens_per_step = float(total_tokens_per_step)
-            if train_speed > 0:
-                logs.setdefault('active_tps', active_tokens_per_step / train_speed)
-                logs.setdefault('total_tps', total_tokens_per_step / train_speed)
-            if total_tokens_per_step > 0:
-                logs.setdefault('mask_ratio', 1.0 - (active_tokens_per_step / total_tokens_per_step))
             if self.throughput_writer is not None:
                 throughput_event = {
                     'step': state.iteration,
