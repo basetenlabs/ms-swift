@@ -29,6 +29,8 @@ class PrintCallback(MegatronCallback):
         self.training_bar.update(self.state.iteration)
         self.current_step = self.state.iteration
         self.start_time = time.time()
+        self.last_log_step = self.state.iteration
+        self.last_log_time = self.start_time
         logging_path = os.path.join(self.args.output_dir, 'logging.jsonl')
         throughput_path = os.environ.get('SWIFT_THROUGHPUT_JSONL') or os.path.join(
             self.args.output_dir, 'throughput_rank0.jsonl')
@@ -60,13 +62,15 @@ class PrintCallback(MegatronCallback):
     def on_log(self, logs):
         state = self.state
         args = self.args
+        is_eval_log = any(k.startswith('eval_') for k in logs.keys())
         logs['iteration'] = f'{state.iteration}/{args.train_iters}'
         elapsed = time.time() - self.start_time
         logs['elapsed_time'] = format_time(elapsed)
-        n_steps = state.iteration - self.start_step
+        window_steps = state.iteration - self.last_log_step
+        window_elapsed = time.time() - self.last_log_time
         train_speed = logs.get('train_speed(s/it)')
         if not isinstance(train_speed, (int, float)):
-            train_speed = elapsed / n_steps if n_steps > 0 else 0.0
+            train_speed = window_elapsed / window_steps if window_steps > 0 else 0.0
         train_speed = float(train_speed)
         logs['remaining_time'] = format_time((args.train_iters - state.iteration) * train_speed)
         memory = reduce_max_stat_across_model_parallel_group(torch.cuda.max_memory_reserved() / 1024**3)
@@ -81,7 +85,7 @@ class PrintCallback(MegatronCallback):
                 throughput_event = {
                     'step': state.iteration,
                     'elapsed_s': elapsed,
-                    'window_steps': n_steps,
+                    'window_steps': window_steps,
                     'train_speed_s_per_it': train_speed,
                     'tokens_active_per_step': active_tokens_per_step,
                     'tokens_total_per_step': total_tokens_per_step,
@@ -90,6 +94,9 @@ class PrintCallback(MegatronCallback):
                     'mask_ratio': logs.get('mask_ratio'),
                 }
                 self.throughput_writer.append(throughput_event)
+        if not is_eval_log and window_steps > 0:
+            self.last_log_step = state.iteration
+            self.last_log_time = time.time()
         logs = {k: round(v, 8) if isinstance(v, float) else v for k, v in logs.items()}
         self.jsonl_writer.append(logs)
         if self.is_write_rank:
