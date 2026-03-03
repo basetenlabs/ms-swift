@@ -1,12 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import os
 import time
 
 import torch
 from tqdm import tqdm
 
 from swift.megatron.utils import reduce_max_stat_across_model_parallel_group
-from swift.utils import JsonlWriter, format_time, get_logger, is_last_rank
+from swift.utils import format_time, get_logger, is_last_rank
 from .base import MegatronCallback
 
 logger = get_logger()
@@ -18,9 +17,9 @@ class PrintCallback(MegatronCallback):
         super().__init__(trainer)
         self.training_bar = None
         self.eval_bar = None
-        self.jsonl_writer = None
-        self.throughput_writer = None
         self.is_write_rank = is_last_rank()
+        self.train_metric_sums = {}
+        self.train_metric_count = 0.0
 
     def on_train_begin(self):
         self.training_bar = tqdm(
@@ -31,15 +30,18 @@ class PrintCallback(MegatronCallback):
         self.start_time = time.time()
         self.last_log_step = self.state.iteration
         self.last_log_time = self.start_time
-        logging_path = os.path.join(self.args.output_dir, 'logging.jsonl')
-        throughput_path = os.environ.get('SWIFT_THROUGHPUT_JSONL') or os.path.join(
-            self.args.output_dir, 'throughput_rank0.jsonl')
-        logger.info(f'logging_path: {logging_path}')
-        logger.info(f'throughput_path: {throughput_path}')
-        self.jsonl_writer = JsonlWriter(logging_path, enable_async=True, write_on_rank='last')
-        self.throughput_writer = JsonlWriter(throughput_path, enable_async=True, write_on_rank='master')
+        self.train_metric_sums = {}
+        self.train_metric_count = 0.0
 
     def on_train_end(self):
+        if self.is_write_rank and self.train_metric_count > 0:
+            avg_metrics = {
+                key: value / self.train_metric_count for key, value in self.train_metric_sums.items()
+            }
+            avg_metrics = {k: round(v, 8) for k, v in sorted(avg_metrics.items())}
+            self.training_bar.write(
+                f"train_avg_metrics(samples={int(self.train_metric_count)}): {avg_metrics}"
+            )
         self.training_bar.close()
         self.training_bar = None
 
@@ -76,28 +78,20 @@ class PrintCallback(MegatronCallback):
         memory = reduce_max_stat_across_model_parallel_group(torch.cuda.max_memory_reserved() / 1024**3)
         logs['memory(GiB)'] = round(memory, 2)
         logs['train_speed(s/it)'] = round(train_speed, 6)
-        active_tokens_per_step = logs.get('tokens_active_per_step')
-        total_tokens_per_step = logs.get('tokens_total_per_step')
-        if isinstance(active_tokens_per_step, (int, float)) and isinstance(total_tokens_per_step, (int, float)):
-            active_tokens_per_step = float(active_tokens_per_step)
-            total_tokens_per_step = float(total_tokens_per_step)
-            if self.throughput_writer is not None:
-                throughput_event = {
-                    'step': state.iteration,
-                    'elapsed_s': elapsed,
-                    'window_steps': window_steps,
-                    'train_speed_s_per_it': train_speed,
-                    'tokens_active_per_step': active_tokens_per_step,
-                    'tokens_total_per_step': total_tokens_per_step,
-                    'active_tps': logs.get('active_tps'),
-                    'total_tps': logs.get('total_tps'),
-                    'mask_ratio': logs.get('mask_ratio'),
-                }
-                self.throughput_writer.append(throughput_event)
+        sample_weight = float(window_steps) if window_steps > 0 else 1.0
+        if not is_eval_log:
+            self._update_running_average(logs, sample_weight)
         if not is_eval_log and window_steps > 0:
             self.last_log_step = state.iteration
             self.last_log_time = time.time()
         logs = {k: round(v, 8) if isinstance(v, float) else v for k, v in logs.items()}
-        self.jsonl_writer.append(logs)
         if self.is_write_rank:
             self.training_bar.write(str(logs))
+
+    def _update_running_average(self, logs, sample_weight: float) -> None:
+        self.train_metric_count += sample_weight
+        for key, value in logs.items():
+            if isinstance(value, (int, float)):
+                if key not in self.train_metric_sums:
+                    self.train_metric_sums[key] = 0.0
+                self.train_metric_sums[key] += float(value) * sample_weight
