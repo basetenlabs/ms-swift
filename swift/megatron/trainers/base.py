@@ -3,6 +3,7 @@ import dataclasses
 import logging
 import os
 import shutil
+import time
 from abc import ABC, abstractmethod
 from contextlib import contextmanager, nullcontext
 from functools import partial
@@ -78,6 +79,8 @@ class BaseMegatronTrainer(ABC):
                 check_local_model_is_latest(args.model_info.model_dir, user_agent=config_info)
 
         self.mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
+        self._last_log_time = None
+        self._last_log_step = None
         self.callbacks = []
         for callback in self.args.callbacks:
             self.callbacks.append(megatron_callbacks_map[callback](self))
@@ -104,9 +107,39 @@ class BaseMegatronTrainer(ABC):
         # the structure here leaves a lot to be desired, but I'm just doing the smallest possible fix for now
         n_steps = logs.pop('n_steps', 1)
         self._log_callback(logs, n_steps)
+        self._preprocess_logs(logs, prefix=prefix)
         if prefix:
             logs = {f'{prefix}{k}': v for k, v in logs.items()}
         self.call_event('on_log', logs=logs)
+
+    def _preprocess_logs(self, logs, prefix=''):
+        """Add derived throughput metrics before callbacks."""
+        if not prefix and 'train_speed(s/it)' not in logs:
+            now = time.time()
+            if self._last_log_time is None or self._last_log_step is None:
+                self._last_log_time = now
+                self._last_log_step = self.state.iteration
+            delta_steps = self.state.iteration - self._last_log_step
+            delta_time = now - self._last_log_time
+            if delta_steps > 0 and delta_time > 0:
+                logs['train_speed(s/it)'] = delta_time / delta_steps
+            else:
+                logs['train_speed(s/it)'] = 0.0
+            if delta_steps > 0:
+                self._last_log_time = now
+                self._last_log_step = self.state.iteration
+
+        active_tokens = logs.get('tokens_active_per_step')
+        total_tokens = logs.get('tokens_total_per_step')
+        train_speed = logs.get('train_speed(s/it)')
+        if isinstance(active_tokens, (int, float)) and isinstance(total_tokens, (int, float)):
+            active_tokens = float(active_tokens)
+            total_tokens = float(total_tokens)
+            if isinstance(train_speed, (int, float)) and train_speed > 0:
+                logs.setdefault('active_tps', active_tokens / float(train_speed))
+                logs.setdefault('total_tps', total_tokens / float(train_speed))
+            if total_tokens > 0:
+                logs.setdefault('mask_ratio', 1.0 - (active_tokens / total_tokens))
 
     def _log_callback(self, logs, n_steps):
         args = self.args
@@ -494,6 +527,8 @@ class BaseMegatronTrainer(ABC):
         if args.async_save and args.use_persistent_ckpt_worker:
             init_persistent_async_worker()
 
+        self._last_log_step = self.state.iteration
+        self._last_log_time = time.time()
         self.call_event('on_train_begin')
         train_metrics = {}
         if self.args.virtual_pipeline_model_parallel_size is not None:
