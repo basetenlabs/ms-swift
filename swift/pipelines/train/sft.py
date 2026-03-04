@@ -5,7 +5,7 @@ from typing import List, Optional, Union
 
 from swift.arguments import SftArguments
 from swift.dataset import (AddLengthPreprocessor, DatasetLoader, EncodePreprocessor, IterablePackingDataset,
-                           LazyLLMDataset, PackingDataset, load_dataset)
+                           LazyLLMDataset, PackingDataset, SequentialSkipLazyLLMDataset, load_dataset)
 from swift.infer_engine import prepare_generation_config
 from swift.ray import RayHelper
 from swift.sequence_parallel import sequence_parallel
@@ -147,7 +147,16 @@ class SwiftSft(SwiftPipeline, TunerMixin):
                 # val_dataset
                 continue
             if not args.streaming and args.truncation_strategy != 'split':
-                dataset = LazyLLMDataset(dataset, template.encode, strict=args.strict, random_state=args.data_seed)
+                if args.lazy_dataset_policy not in {'random', 'sequential_skip'}:
+                    raise ValueError(
+                        f'Unsupported lazy_dataset_policy: {args.lazy_dataset_policy}. '
+                        'Expected one of: random, sequential_skip.')
+                dataset = SequentialSkipLazyLLMDataset(
+                    dataset,
+                    template.encode,
+                    randomize_dataset=args.lazy_dataset_policy == 'random',
+                    random_seed=args.data_seed,
+                )
             if args.packing:
                 packing_dataset_cls = IterablePackingDataset if args.streaming else PackingDataset
                 dataset = packing_dataset_cls(
