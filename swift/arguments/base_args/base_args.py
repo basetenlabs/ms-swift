@@ -85,6 +85,7 @@ class BaseArguments(GenerationArguments, QuantizeArguments, DataArguments, Templ
     packing_length: Optional[int] = None
     packing_num_proc: int = 1
     lazy_tokenize: Optional[bool] = None
+    lazy_dataset_policy: Literal['random', 'sequential_skip'] = 'random'
     # hub
     use_hf: bool = False
     # None: use env var `MODELSCOPE_API_TOKEN`

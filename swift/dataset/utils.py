@@ -114,6 +114,84 @@ class LazyLLMDataset(Dataset):
         return len(self.dataset)
 
 
+class SequentialSkipLazyLLMDataset(LazyLLMDataset):
+    """Resilient lazy dataset with optional randomized traversal and permanent over-length skipping."""
+
+    def __init__(self,
+                 dataset: HfDataset,
+                 encode_func: Callable[[Dict[str, Any]], Dict[str, Any]],
+                 *,
+                 randomize_dataset: bool = False,
+                 random_seed: Optional[int] = None,
+                 traceback_limit: int = 10) -> None:
+        # strict is intentionally disabled for this variant.
+        super().__init__(
+            dataset,
+            encode_func,
+            n_try_fetch=max(1, len(dataset)),
+            strict=False,
+            random_state=random_seed,
+            traceback_limit=traceback_limit)
+        # Behave like "infinite n_try_fetch": keep retrying until a valid item is found.
+        self.n_try_fetch = float('inf')
+        self.randomize_dataset = randomize_dataset
+        self._skip_idx_set = set()
+        self._repeat_traceback_counts = {}
+        if self.randomize_dataset:
+            self._idx_order = self.random_state.permutation(len(self.dataset)).tolist()
+        else:
+            self._idx_order = list(range(len(self.dataset)))
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        if isinstance(idx, str):
+            return self.dataset[idx]
+        dataset_len = len(self.dataset)
+        start_pos = idx % dataset_len
+        offset = 0
+
+        while True:
+            i = self._idx_order[(start_pos + offset) % dataset_len]
+            offset += 1
+            if i in self._skip_idx_set:
+                continue
+
+            data = self.dataset[i]
+            try:
+                return self.encode_func(data, return_length=True)
+            except Exception as e:
+                try:
+                    from swift.template import MaxLengthError
+                    if isinstance(e, MaxLengthError):
+                        self._skip_idx_set.add(i)
+                        continue
+                except Exception:
+                    pass
+                self._log_traceback_with_dedupe(e)
+                continue
+
+    def _log_traceback_with_dedupe(self, e: Exception) -> None:
+        import traceback
+        tb = traceback.extract_tb(e.__traceback__)
+        if tb:
+            frame = tb[-1]
+            site = (frame.filename, frame.name, frame.lineno, type(e).__name__)
+        else:
+            site = ("<unknown>", "<unknown>", -1, type(e).__name__)
+
+        seen_count = self._repeat_traceback_counts.get(site, 0) + 1
+        self._repeat_traceback_counts[site] = seen_count
+
+        if seen_count == 1 and (self.traceback_limit is None or self._traceback_counter < self.traceback_limit):
+            logger.info(''.join(traceback.format_exception(type(e), e, e.__traceback__)))
+            logger.warning('👆👆👆There are errors in the template.encode; selecting another sample.')
+            self._traceback_counter += 1
+            return
+
+        logger.warning(
+            f'Similar traceback seen {seen_count} times at '
+            f'{site[0]}:{site[2]} ({site[1]}::{site[3]}). Continuing with another sample.')
+
+
 class EncodePreprocessor(RowPreprocessor):
 
     def __init__(self, template: 'Template'):
