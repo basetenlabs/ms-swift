@@ -381,7 +381,7 @@ class ChatCompletionMessageToolCall:
 @dataclass
 class ChatMessage:
     role: Literal['system', 'user', 'assistant']
-    content: Union[str, List[Dict[str, Any]], int, float, List[float]]
+    content: Optional[Union[str, List[Dict[str, Any]], int, float, List[float]]] = None
     tool_calls: Optional[List[ChatCompletionMessageToolCall]] = None
     reasoning_content: Optional[str] = None
 
@@ -390,7 +390,7 @@ class ChatMessage:
 class ChatCompletionResponseChoice:
     index: int
     message: ChatMessage
-    finish_reason: Literal['stop', 'length', None]
+    finish_reason: Literal['stop', 'length', 'tool_calls', None]
     logprobs: Optional[Dict[str, List[Dict[str, Any]]]] = None
     token_ids: Optional[List[int]] = None
 
@@ -421,7 +421,7 @@ class EmbeddingResponse:
 class CompletionResponseChoice:
     index: int
     text: str
-    finish_reason: Literal['stop', 'length', None]
+    finish_reason: Literal['stop', 'length', 'tool_calls', None]
     logprobs: Optional[Dict[str, List[Dict[str, Any]]]] = None
 
 
@@ -525,7 +525,7 @@ class DeltaMessage:
 class ChatCompletionResponseStreamChoice:
     index: int
     delta: DeltaMessage
-    finish_reason: Literal['stop', 'length', None]
+    finish_reason: Literal['stop', 'length', 'tool_calls', None]
     logprobs: Optional[Dict[str, List[Dict[str, Any]]]] = None
 
     def to_cmpl_choice(self) -> 'CompletionResponseStreamChoice':
@@ -538,7 +538,7 @@ class ChatCompletionResponseStreamChoice:
 class CompletionResponseStreamChoice:
     index: int
     text: str
-    finish_reason: Literal['stop', 'length', None]
+    finish_reason: Literal['stop', 'length', 'tool_calls', None]
     logprobs: Optional[Dict[str, List[Dict[str, Any]]]] = None
 
 

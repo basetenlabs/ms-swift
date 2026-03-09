@@ -164,7 +164,8 @@ class VLLMClient:
                     try:
                         parsed.append(RolloutOutput.model_validate(item))
                     except ValidationError:
-                        parsed.append(ChatCompletionResponse(**item))
+                        resp_dict = item.get('response', item) if isinstance(item, dict) else item
+                        parsed.append(ChatCompletionResponse(**resp_dict))
                 results[i] = parsed
             except Exception as e:
                 errors[i] = e
