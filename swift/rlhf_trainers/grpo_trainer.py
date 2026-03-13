@@ -1016,6 +1016,44 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         self._metrics[mode]['completions/min_length'].append(total_lengths.min().item())
         self._metrics[mode]['completions/max_length'].append(total_lengths.max().item())
 
+        # --- diagnostic: completion_mask coverage vs sequence length ---
+        # Log what fraction of each sequence is trainable (completion_mask=True)
+        all_coverage_ratios = []
+        for batch_encoded in ga_batch_encoded_inputs:
+            cm = batch_encoded['completion_mask']  # [batch_size, logits_to_keep]
+            completion_counts = cm.sum(dim=1)  # per-sample trainable token count
+            if 'input_ids' in batch_encoded:
+                seq_lengths = torch.tensor(
+                    [batch_encoded['input_ids'].shape[1]] * cm.shape[0],
+                    device=cm.device, dtype=torch.float32)
+            else:
+                seq_lengths = batch_encoded.get('seq_lengths', completion_counts).float()
+            coverage_ratios = completion_counts.float() / seq_lengths.clamp(min=1.0)
+            all_coverage_ratios.extend(coverage_ratios.tolist())
+            logger.info(
+                f'Token mask diagnostic: '
+                f'completion_tokens_per_sample={completion_counts.tolist()}, '
+                f'seq_lengths={seq_lengths.int().tolist()}, '
+                f'coverage_ratio={[f"{r:.3f}" for r in coverage_ratios.tolist()]}')
+        if all_coverage_ratios:
+            mean_coverage = sum(all_coverage_ratios) / len(all_coverage_ratios)
+            self._metrics[mode]['completions/mask_coverage_ratio'].append(mean_coverage)
+
+        # --- diagnostic: compare extracted token_ids vs completion_mask count ---
+        for inp in inputs:
+            rollout_infos = inp.get('rollout_infos', {})
+            if 'per_turn_token_counts' in rollout_infos:
+                per_turn = rollout_infos['per_turn_token_counts']
+                total_extracted = rollout_infos.get('total_extracted_tokens', sum(per_turn))
+                total_vllm = rollout_infos.get('total_vllm_reported_tokens', -1)
+                rollout_id = rollout_infos.get('rollout_id', 'unknown')
+                logger.info(
+                    f'Rollout token diagnostic [{rollout_id}]: '
+                    f'turns={len(per_turn)} '
+                    f'per_turn_tokens={per_turn} '
+                    f'total_extracted={total_extracted} '
+                    f'total_vllm_reported={total_vllm}')
+
         # --- log completion clipped ratio ---
         local_trunc_masks = [inp['truncated_mask'].tolist() for inp in ga_batch_encoded_inputs]
         total_trunc_masks = self._gather_and_flatten(
