@@ -653,6 +653,34 @@ class BaseMegatronTrainer(ABC):
             forward_only=False,
         )
 
+        # [GRAD_DIAG] Check main_grad AFTER backward, BEFORE optimizer step
+        _diag_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if _diag_rank == 0 and not hasattr(self, "_diag_step"):
+            self._diag_step = 0
+        if _diag_rank == 0 and self._diag_step < 5:
+            _lora_mg_nonzero = 0
+            _lora_mg_total = 0
+            _lora_pg_nonzero = 0
+            _all_mg_nonzero = 0
+            _all_mg_total = 0
+            for _name, _param in self.unwrapped_models[0].named_parameters():
+                if _param.requires_grad:
+                    _all_mg_total += 1
+                    if hasattr(_param, "main_grad") and _param.main_grad.abs().max() > 0:
+                        _all_mg_nonzero += 1
+                    if "lora" in _name.lower():
+                        _lora_mg_total += 1
+                        if hasattr(_param, "main_grad") and _param.main_grad.abs().max() > 0:
+                            _lora_mg_nonzero += 1
+                        if _param.grad is not None and _param.grad.abs().max() > 0:
+                            _lora_pg_nonzero += 1
+                        if _lora_mg_total <= 3:
+                            _mg = _param.main_grad.abs().max().item() if hasattr(_param, "main_grad") else -1
+                            _pg = _param.grad.abs().max().item() if _param.grad is not None else -1
+                            logger.info(f"[GRAD_DIAG_BASE step={self._diag_step}] PRE-OPT LoRA {_name}: main_grad_max={_mg:.8e}, param.grad_max={_pg:.8e}")
+            logger.info(f"[GRAD_DIAG_BASE step={self._diag_step}] PRE-OPT Summary: trainable={_all_mg_total}, all_mg_nonzero={_all_mg_nonzero}, lora_total={_lora_mg_total}, lora_mg_nonzero={_lora_mg_nonzero}, lora_pg_nonzero={_lora_pg_nonzero}")
+            self._diag_step += 1
+
         _, grad_norm, _ = self.optimizer.step()
 
         grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)

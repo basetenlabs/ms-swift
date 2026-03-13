@@ -94,8 +94,13 @@ class MegatronRLHFTrainer(BaseMegatronTrainer):
 
     def _postprocess_packed_tensor_cp(self, tensor, packed_seq_params, num_samples):
         """
-        Generic method: In CP mode, all_gather and reconstruct full tensor sequences.
+        In CP mode, all_gather and reconstruct full tensor sequences.
         Works for both logps (float) and masks (bool/int).
+
+        Uses torch.cat for reconstruction to preserve autograd gradient flow
+        through the local CP rank's tensor. Remote ranks' tensors are naturally
+        detached (from all_gather), which is correct — each rank computes its
+        own gradients independently, matching megatron's CP design.
 
         Args:
             tensor: [1, packed_len/cp_size] in padding_free mode, or [batch_size, seq_len/cp_size] otherwise
@@ -109,66 +114,67 @@ class MegatronRLHFTrainer(BaseMegatronTrainer):
         cp_size = args.context_parallel_size
         cp_rank = mpu.get_context_parallel_rank()
 
-        # All-gather across CP ranks
+        # All-gather across CP ranks.
+        # Remote ranks' tensors are detached (no gradient connection), which is correct:
+        # each CP rank only needs gradients for its own chunk.
         output_list = [torch.empty_like(tensor) for _ in range(cp_size)]
         torch.distributed.all_gather(output_list, tensor.contiguous(), group=mpu.get_context_parallel_group())
+        # Restore the local rank's original tensor (with autograd graph intact)
         output_list[cp_rank] = tensor
 
         if packed_seq_params is not None:
-            # padding_free mode: [1, packed_len/cp_size] -> [1, packed_len]
-            cu_seqlens_full = packed_seq_params.cu_seqlens_q
-            cu_seqlens_cp = cu_seqlens_full // cp_size
-
-            # Calculate total packed length
-            total_packed_len = cu_seqlens_full[num_samples].item()
-            output_full = tensor.new_zeros(1, total_packed_len)
-
-            # Reconstruct each sequence
-            for i in range(num_samples):
-                start_full = cu_seqlens_full[i].item()
-                end_full = cu_seqlens_full[i + 1].item()
-                seq_len = end_full - start_full
-
-                # Length of each chunk after CP split
-                chunk_len = seq_len // cp_size
-                half_chunk = chunk_len // 2
-
-                # Concatenate from each CP rank's output (load-balanced split)
-                for j in range(cp_size):
-                    o = output_list[j][0]
-                    start_cp = cu_seqlens_cp[i].item()
-
-                    # Get two half chunks (CP's load-balanced split)
-                    o0 = o[start_cp:start_cp + half_chunk]
-                    o1 = o[start_cp + half_chunk:start_cp + chunk_len]
-
-                    # Place back to full sequence
-                    output_full[0, start_full + j * half_chunk:start_full + (j + 1) * half_chunk] = o0
-                    output_full[0, end_full - (j + 1) * half_chunk:end_full - j * half_chunk] = o1
+            return self._reconstruct_packed_cp(output_list, packed_seq_params, num_samples, cp_size)
         else:
-            # non-padding_free mode: [batch_size, seq_len/cp_size] -> [batch_size, seq_len]
-            # Each CP rank has chunks split with load-balanced pattern (2*cp_size chunks)
-            batch_size = tensor.shape[0]
-            seq_len_per_cp = tensor.shape[1]
-            full_seq_len = seq_len_per_cp * cp_size
+            return self._reconstruct_batch_cp(output_list, tensor, cp_size)
 
-            output_full = tensor.new_zeros(batch_size, full_seq_len)
+    def _reconstruct_packed_cp(self, output_list, packed_seq_params, num_samples, cp_size):
+        """Reconstruct packed (padding_free) sequences from CP chunks using torch.cat."""
+        cu_seqlens_full = packed_seq_params.cu_seqlens_q
+        cu_seqlens_cp = cu_seqlens_full // cp_size
 
-            # Each CP rank j holds chunks j and (2*cp_size - j - 1) from the original 2*cp_size split
-            # Reconstruct the full sequence by placing chunks back in correct positions
-            chunk_len = full_seq_len // (2 * cp_size)
+        seq_tensors = []
+        for i in range(num_samples):
+            start_full = cu_seqlens_full[i].item()
+            end_full = cu_seqlens_full[i + 1].item()
+            seq_len = end_full - start_full
+            chunk_len = seq_len // cp_size
+            half_chunk = chunk_len // 2
+            start_cp = cu_seqlens_cp[i].item()
 
+            # Collect 2*cp_size half-chunks in original sequence order.
+            # CP load-balanced split: rank j holds positions [j*half_chunk, (j+1)*half_chunk)
+            # from the front and [(cp_size-j-1)*half_chunk, (cp_size-j)*half_chunk) from the back.
+            # Front halves: position indices 0..cp_size-1 (left to right)
+            # Back halves: position indices cp_size..2*cp_size-1 (right to left)
+            ordered_chunks = [None] * (2 * cp_size)
             for j in range(cp_size):
-                o = output_list[j]  # [batch_size, seq_len_per_cp]
-                # This rank holds 2 chunks: chunk j and chunk (2*cp_size - j - 1)
-                half_len = seq_len_per_cp // 2
-                o0 = o[:, :half_len]  # First half -> chunk j
-                o1 = o[:, half_len:]  # Second half -> chunk (2*cp_size - j - 1)
+                o = output_list[j][0]
+                o0 = o[start_cp:start_cp + half_chunk]
+                o1 = o[start_cp + half_chunk:start_cp + chunk_len]
+                ordered_chunks[j] = o0
+                ordered_chunks[2 * cp_size - j - 1] = o1
 
-                # Place chunk j at position j * chunk_len
-                output_full[:, j * chunk_len:(j + 1) * chunk_len] = o0
-                # Place chunk (2*cp_size - j - 1) at position (2*cp_size - j - 1) * chunk_len
-                reverse_idx = 2 * cp_size - j - 1
-                output_full[:, reverse_idx * chunk_len:(reverse_idx + 1) * chunk_len] = o1
+            seq_tensors.append(torch.cat(ordered_chunks, dim=0))
 
-        return output_full
+        total_packed_len = cu_seqlens_full[num_samples].item()
+        if seq_tensors:
+            result = torch.cat(seq_tensors, dim=0).unsqueeze(0)
+        else:
+            result = output_list[0].new_zeros(1, total_packed_len)
+        return result
+
+    def _reconstruct_batch_cp(self, output_list, tensor, cp_size):
+        """Reconstruct batched (non-padding_free) sequences from CP chunks using torch.cat."""
+        seq_len_per_cp = tensor.shape[1]
+        half_len = seq_len_per_cp // 2
+
+        # Build 2*cp_size chunks in original sequence order.
+        # Rank j holds chunk j (first half) and chunk (2*cp_size-j-1) (second half).
+        ordered_chunks = [None] * (2 * cp_size)
+        for j in range(cp_size):
+            o = output_list[j]  # [batch_size, seq_len_per_cp]
+            ordered_chunks[j] = o[:, :half_len]
+            ordered_chunks[2 * cp_size - j - 1] = o[:, half_len:]
+
+        # torch.cat along seq dim preserves autograd for local rank's slices
+        return torch.cat(ordered_chunks, dim=1)
