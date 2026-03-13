@@ -39,7 +39,6 @@ from .rollout_mixin import MegatronRolloutMixin
 from .utils import gather, gather_object
 from .vocab_parallel_utils import compute_logps_and_entropy_from_logits
 
-from .grad_diagnostics import patch_grad_diagnostics
 logger = get_logger()
 
 
@@ -57,7 +56,6 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self._prepare_rewards()
         self._prepare_scheduler()
         self._train_dataset = None
-
 
     def train(self, train_dataset, val_dataset):
         # Store dataset provider for lazy resample iterator initialization
@@ -241,7 +239,6 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             # TODO: VPP (Virtual Pipeline Parallelism)
             resample_data_iterator = self._prepare_data_iterator(self._train_dataset, use_origin_cyclic=True)
             self._train_dataset = None
-
         finally:
             # Restore original random states to avoid affecting training
             set_random_seed(
@@ -249,7 +246,6 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 args.data_parallel_random_init,
                 args.te_rng_tracker,
             )
-        patch_grad_diagnostics(self)
         return resample_data_iterator
 
     def _replace_data_iterator(self, data_iterator):
