@@ -1004,11 +1004,23 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         we keep the fixed group structure and NaN-mask invalid members. _compute_advantages uses
         nanmean/nanstd to compute over valid members only, and NaN advantages are zeroed out
         before the loss so they produce zero gradient.
+
+        Also truncates invalid rollouts' completions to a single empty token to prevent OOM:
+        timeout/error rollouts can accumulate very long sequences that serve no purpose (they
+        contribute zero gradient) but consume GPU memory during forward/backward passes.
         """
         for i, sample in enumerate(rollout_batch):
             info = sample.get('rollout_infos') or {}
             if not info.get('reward_valid', True):
                 rewards_per_func[i, :] = float('nan')
+                # Truncate completion to minimal length to prevent OOM from long failed sequences
+                for msg in sample.get('messages', []):
+                    if msg['role'] == 'assistant':
+                        msg['content'] = ''
+                if 'response_token_ids' in sample:
+                    sample['response_token_ids'] = []
+                if 'response_loss_mask' in sample:
+                    sample['response_loss_mask'] = []
         return rewards_per_func
 
     def _maybe_compute_logps(self, batch: Dict[str, Any]) -> Dict[str, Any]:
