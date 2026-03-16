@@ -58,9 +58,8 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self._train_dataset = None
 
     def train(self, train_dataset, val_dataset):
-        # Store dataset for lazy resample iterator initialization
-        # Used by dynamic_sample, truncation_strategy='delete', and invalid group refill
-        self._train_dataset = train_dataset
+        if self.dynamic_sample or self.truncation_strategy == 'delete':
+            self._train_dataset = train_dataset
         super().train(train_dataset, val_dataset)
 
     def _init_grpo_params(self):
@@ -254,23 +253,12 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             for _ in range(num_iters_per_step):
                 rollout_batch.extend(next(data_iterator))
             micro_batch_data = self._generate_and_score_completions(rollout_batch)
-
-            if not micro_batch_data:
-                # Generation step skipped (all groups invalid after retries)
-                logger.warning('Skipping generation step: no valid prompt groups after refill retries.')
-                self._log_invalid_skip_metrics()
-                # Reuse previous buffered inputs if available; otherwise pull next batch
-                if self._buffered_inputs is None:
-                    self._step += 1
-                    return self._replace_data_iterator(data_iterator)
-
-            else:
-                num_mini_batch = self.global_batch_size // (self.micro_batch_size * mpu.get_data_parallel_world_size())
-                mini_batch_data = [
-                    micro_batch_data[i:i + num_mini_batch] for i in range(0, len(micro_batch_data), num_mini_batch)
-                ]
-                assert len(mini_batch_data) == self.steps_per_generation
-                self._buffered_inputs = mini_batch_data
+            num_mini_batch = self.global_batch_size // (self.micro_batch_size * mpu.get_data_parallel_world_size())
+            mini_batch_data = [
+                micro_batch_data[i:i + num_mini_batch] for i in range(0, len(micro_batch_data), num_mini_batch)
+            ]
+            assert len(mini_batch_data) == self.steps_per_generation
+            self._buffered_inputs = mini_batch_data
 
         inputs = self._buffered_inputs[self._step % self.steps_per_generation]
         self._step += 1
@@ -403,10 +391,8 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         rewards_per_func = self._score_completions(rollout_batch)
 
-        # Exclude prompt groups with invalid rollouts and refill with fresh data
-        rollout_batch, rewards_per_func, skipped = self._invalid_group_refill(rollout_batch, rewards_per_func)
-        if skipped:
-            return []
+        # NaN-mask invalid rollouts so they're excluded from advantage computation
+        rewards_per_func = self._mask_invalid_rollouts(rollout_batch, rewards_per_func)
 
         # Dynamic sampling for std=0 groups (DAPO)
         if self.dynamic_sample:
@@ -774,8 +760,8 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         grouped_rewards = rewards.view(-1, num_generations)
         K = num_generations
 
-        # Compute group statistics
-        group_rewards_mean = grouped_rewards.mean(dim=1)
+        # NaN-safe group statistics (NaN rewards from invalid rollouts are excluded)
+        group_rewards_mean = torch.nanmean(grouped_rewards, dim=1)
 
         # Broadcast stats back to the original shape
         group_rewards_mean = group_rewards_mean.repeat_interleave(K)
@@ -796,18 +782,24 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         # Normalize advantages based on estimator and scale_rewards
         if self.advantage_estimator == 'reinforce_plus_plus':
-            # REINFORCE++: Use std of advantages (not rewards)
+            # REINFORCE++: Use std of advantages (not rewards), NaN-safe
             if self.scale_rewards == 'batch':
                 # Global whitening: std computed on advantages
                 if advantages.numel() > 1:
-                    advantages_std = advantages.std().expand_as(advantages)
+                    advantages_std = nanstd(advantages).expand_as(advantages)
                 else:  # edge case: num_generations_eval=batch_size=1
                     advantages_std = torch.zeros_like(advantages)
             elif self.scale_rewards == 'group':
-                # Group-level whitening on advantages
+                # Group-level whitening on advantages, NaN-safe
                 advantages_grouped = advantages.view(-1, K)
                 if K > 1:
-                    advantages_std = advantages_grouped.std(dim=1).repeat_interleave(K)
+                    a_valid_mask = ~torch.isnan(advantages_grouped)
+                    a_valid_count = a_valid_mask.sum(dim=1).clamp(min=1)
+                    a_group_mean = torch.nanmean(advantages_grouped, dim=1, keepdim=True)
+                    advantages_std = torch.sqrt(
+                        ((advantages_grouped - a_group_mean).nan_to_num(0.0) ** 2 * a_valid_mask).sum(dim=1)
+                        / (a_valid_count - 1).clamp(min=1)
+                    ).repeat_interleave(K)
                 else:  # edge case: num_generations_eval=1
                     advantages_std = torch.zeros_like(advantages)
             else:  # 'none'
@@ -815,17 +807,23 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             if advantages_std is not None:
                 advantages = normalize_advantages(advantages, advantages_std)
         else:  # 'grpo' or 'rloo'
-            # GRPO/RLOO: Use std of original rewards
+            # GRPO/RLOO: Use std of original rewards (NaN-safe)
             if self.scale_rewards == 'batch':
                 # Global batch-level normalization
                 if rewards.numel() > 1:
-                    rewards_std = rewards.std().expand_as(rewards)
+                    rewards_std = nanstd(rewards).expand_as(rewards)
                 else:  # edge case: num_generations_eval=batch_size=1
                     rewards_std = torch.zeros_like(rewards)
             elif self.scale_rewards == 'group':
-                # Group-level normalization (default)
+                # Group-level normalization (default), NaN-safe
                 if K > 1:
-                    rewards_std = grouped_rewards.std(dim=1).repeat_interleave(K)
+                    valid_mask = ~torch.isnan(grouped_rewards)
+                    valid_count = valid_mask.sum(dim=1).clamp(min=1)
+                    group_mean = torch.nanmean(grouped_rewards, dim=1, keepdim=True)
+                    rewards_std = torch.sqrt(
+                        ((grouped_rewards - group_mean).nan_to_num(0.0) ** 2 * valid_mask).sum(dim=1)
+                        / (valid_count - 1).clamp(min=1)
+                    ).repeat_interleave(K)
                 else:  # edge case: num_generations_eval=1
                     rewards_std = torch.zeros_like(rewards)
             elif self.scale_rewards == 'gdpo':
@@ -834,14 +832,19 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 for i in range(num_reward_funcs):
                     reward_i = total_rewards_per_func[:, i]
                     grouped_reward_i = reward_i.view(-1, K)
-                    group_mean = grouped_reward_i.mean(dim=1, keepdim=True)
-                    group_std = grouped_reward_i.std(dim=1, keepdim=True) + 1e-8
-                    normalized_i = (grouped_reward_i - group_mean) / group_std
+                    group_mean = torch.nanmean(grouped_reward_i, dim=1, keepdim=True)
+                    gd_valid = ~torch.isnan(grouped_reward_i)
+                    gd_count = gd_valid.sum(dim=1, keepdim=True).clamp(min=1)
+                    group_std = torch.sqrt(
+                        ((grouped_reward_i - group_mean).nan_to_num(0.0) ** 2 * gd_valid).sum(dim=1, keepdim=True)
+                        / (gd_count - 1).clamp(min=1)
+                    ) + 1e-8
+                    normalized_i = ((grouped_reward_i - group_mean) / group_std).nan_to_num(0.0)
                     normalized_i = normalized_i.view(-1)
                     normalized_advantages_list.append(self.reward_weights[i] * normalized_i)
                 summed_advantages = sum(normalized_advantages_list)
-                batch_mean = summed_advantages.mean()
-                batch_std = summed_advantages.std() + 1e-8
+                batch_mean = torch.nanmean(summed_advantages)
+                batch_std = nanstd(summed_advantages) + 1e-8
                 advantages = (summed_advantages - batch_mean) / batch_std
                 rewards_std = None
             else:  # 'none'
@@ -854,18 +857,35 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             # rewards: [prompt_batch_size, num_generations]
             # rewards_per_func_for_metrics: [prompt_batch_size*num_generations, self.num_reward_funcs]
             group_rewards = rewards.view(-1, num_generations)
-            rewards_mean = group_rewards.mean(-1).mean().item()
-            # Compute std based on scale_rewards setting for logging
+            rewards_mean = torch.nanmean(group_rewards).item()
+            # Compute std based on scale_rewards setting for logging (NaN-safe)
             if self.scale_rewards in ['group', 'none', 'gdpo']:
-                # Handle edge case when num_generations_eval=1
                 if num_generations > 1:
-                    rewards_std = group_rewards.std(-1).mean().item()
+                    # Per-group nanstd, then average across groups
+                    valid_mask = ~torch.isnan(group_rewards)
+                    valid_count = valid_mask.sum(dim=1).clamp(min=1)
+                    gm = torch.nanmean(group_rewards, dim=1, keepdim=True)
+                    group_var = ((group_rewards - gm).nan_to_num(0.0) ** 2 * valid_mask).sum(dim=1) \
+                        / (valid_count - 1).clamp(min=1)
+                    rewards_std = torch.sqrt(group_var).nanmean().item()
                 else:
                     rewards_std = 0.0
             elif self.scale_rewards == 'batch':
-                rewards_std = rewards.std().item() if rewards.numel() > 1 else 0.0
+                rewards_std = nanstd(rewards).item() if rewards.numel() > 1 else 0.0
             if num_generations > 1:
-                is_std_zero = torch.isclose(group_rewards.std(dim=1), torch.zeros_like(group_rewards.std(dim=1)))
+                # Per-group std for zero-std fraction; NaN groups get NaN std,
+                # and isclose(NaN, 0) = False so they're automatically excluded
+                valid_mask_log = ~torch.isnan(group_rewards)
+                vc = valid_mask_log.sum(dim=1).clamp(min=1)
+                gm_log = torch.nanmean(group_rewards, dim=1, keepdim=True)
+                group_std = torch.sqrt(
+                    ((group_rewards - gm_log).nan_to_num(0.0) ** 2 * valid_mask_log).sum(dim=1)
+                    / (vc - 1).clamp(min=1)
+                )
+                # Groups where ALL members are NaN should not count — set their std to NaN
+                all_nan_mask = valid_mask_log.sum(dim=1) == 0
+                group_std[all_nan_mask] = float('nan')
+                is_std_zero = torch.isclose(group_std, torch.zeros_like(group_std))
             else:
                 is_std_zero = torch.ones(group_rewards.size(0), dtype=torch.bool, device=group_rewards.device)
 
@@ -878,6 +898,14 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 col = rewards_per_func_for_metrics[:, i]
                 self._metrics[mode][f'rewards/{name}/mean'].append(torch.nanmean(col).item())
                 self._metrics[mode][f'rewards/{name}/std'].append(nanstd(col).item())
+
+        # Log NaN masking metrics
+        nan_count = torch.isnan(rewards).sum().item()
+        total_count = rewards.numel()
+        self._metrics[mode]['rollout/nan_masked_frac'].append(nan_count / max(total_count, 1))
+
+        # Zero out NaN advantages so they don't produce NaN gradients
+        advantages = advantages.nan_to_num(0.0)
 
         log_rewards_metrics(rewards=grouped_rewards, rewards_per_func_for_metrics=total_rewards_per_func)
         self._logs['advantages'].extend(advantages.tolist())
@@ -969,135 +997,19 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         return rollout_batch, rewards_per_func
 
-    def _invalid_group_refill(
-        self,
-        rollout_batch: DataType,
-        rewards_per_func: torch.Tensor,
-    ) -> Tuple[DataType, torch.Tensor, bool]:
-        """Exclude prompt groups containing invalid rollouts and refill with fresh data.
+    def _mask_invalid_rollouts(self, rollout_batch: DataType, rewards_per_func: torch.Tensor) -> torch.Tensor:
+        """Set rewards to NaN for invalid rollouts so they're excluded from advantage computation.
 
-        Unlike dynamic_sample (DAPO) which replaces zero-variance groups, this targets
-        invalid rollouts (infrastructure failures, zero-turn, judge errors) — missing
-        data that should not be trained on at all.
-
-        Returns:
-            (rollout_batch, rewards_per_func, skipped) where skipped=True means
-            the entire generation step should be skipped.
+        Instead of refilling invalid groups (which burns rollout time at the same failure rate),
+        we keep the fixed group structure and NaN-mask invalid members. _compute_advantages uses
+        nanmean/nanstd to compute over valid members only, and NaN advantages are zeroed out
+        before the loss so they produce zero gradient.
         """
-        mode = 'train' if self.unwrapped_models[0].training else 'eval'
-        num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
-
-        resample_count = 0
-        valid_samples = []
-        valid_rewards_per_func = []
-        n_total_groups = 0
-        n_resampled = 0
-
-        while resample_count <= self.max_resample_times:
-            # Gather across rollout group to get global view
-            global_rollout_batch = gather_object(rollout_batch)
-            global_rewards_per_func = gather(rewards_per_func)
-
-            n_samples = len(global_rollout_batch)
-            n_groups = n_samples // num_generations
-            if resample_count == 0:
-                n_total_groups = n_groups
-
-            # Build per-sample validity mask from rollout_infos
-            validity_flags = []
-            for sample in global_rollout_batch:
-                info = sample.get('rollout_infos') or {}
-                validity_flags.append(info.get('reward_valid', True))
-
-            # A prompt group is invalid if ANY generation in the group is invalid
-            group_valid = []
-            for g in range(n_groups):
-                start = g * num_generations
-                end = start + num_generations
-                group_valid.append(all(validity_flags[start:end]))
-
-            # Collect valid groups
-            for g in range(n_groups):
-                if group_valid[g]:
-                    start = g * num_generations
-                    end = start + num_generations
-                    valid_samples.extend(global_rollout_batch[start:end])
-                    valid_rewards_per_func.append(global_rewards_per_func[start:end])
-
-            n_invalid = sum(1 for v in group_valid if not v)
-
-            if len(valid_samples) >= self.generation_batch_size or n_invalid == 0:
-                break
-
-            if resample_count >= self.max_resample_times:
-                break
-
-            n_resampled += n_invalid
-            n_groups_needed = (self.generation_batch_size - len(valid_samples)) // num_generations
-            if n_groups_needed <= 0:
-                break
-
-            logger.info(f'Invalid group refill: {n_invalid}/{n_groups} groups invalid, '
-                        f'{len(valid_samples)}/{self.generation_batch_size} valid so far, '
-                        f'resampling {n_groups_needed} groups (attempt {resample_count + 1})')
-
-            # Lazy init resample iterator (shared with dynamic_sample)
-            if not hasattr(self, 'resample_data_iterator') or self.resample_data_iterator is None:
-                self.resample_data_iterator = self._init_resample_data_iterator()[0]
-
-            # Pull fresh prompts for n_groups_needed groups
-            n_prompts_needed = n_groups_needed
-            next_rollout_prompt_batch = []
-            # Each iterator step yields per_device_generation_batch_size / num_generations prompts
-            num_iters_per_step = self.get_num_iters_per_step()
-            for _ in range(num_iters_per_step):
-                next_rollout_prompt_batch.extend(next(self.resample_data_iterator))
-            next_rollout_prompt_batch = next_rollout_prompt_batch[:n_prompts_needed]
-
-            if self.truncation_strategy == 'delete':
-                next_rollout_prompt_batch = self.resample_encode_failed_inputs(next_rollout_prompt_batch)
-
-            rollout_batch = self.get_local_rollout_batch(next_rollout_prompt_batch)
-            rollout_batch = self._generate_completions(rollout_batch)
-            rewards_per_func = self._score_completions(rollout_batch)
-            resample_count += 1
-
-        # Log metrics
-        n_valid_groups = len(valid_samples) // num_generations if num_generations > 0 else 0
-        n_invalid_groups = n_total_groups - n_valid_groups + n_resampled
-        self._metrics[mode]['rollout/invalid_group_frac'].append(
-            n_invalid_groups / max(n_total_groups + n_resampled, 1))
-        self._metrics[mode]['rollout/resampled_group_frac'].append(
-            n_resampled / max(n_total_groups, 1))
-        self._metrics[mode]['rollout/valid_group_count'].append(n_valid_groups)
-
-        if len(valid_samples) >= self.generation_batch_size:
-            rank = self.process_index
-            per_device_batch_size = self.per_device_generation_batch_size
-            data_slice = slice(rank * per_device_batch_size, (rank + 1) * per_device_batch_size)
-            rollout_batch = valid_samples[:self.generation_batch_size][data_slice]
-            rewards_per_func = torch.cat(valid_rewards_per_func)[:self.generation_batch_size][data_slice]
-            return rollout_batch, rewards_per_func, False
-
-        if valid_samples:
-            # Partial batch — use what we have, padded to local slice
-            rank = self.process_index
-            per_device_batch_size = self.per_device_generation_batch_size
-            data_slice = slice(rank * per_device_batch_size, (rank + 1) * per_device_batch_size)
-            rollout_batch = valid_samples[data_slice]
-            rewards_per_func = torch.cat(valid_rewards_per_func)[data_slice] if valid_rewards_per_func else rewards_per_func[:0]
-            if rollout_batch:
-                return rollout_batch, rewards_per_func, False
-
-        logger.warning(f'No valid prompt groups after {resample_count} refill attempts. Skipping generation step.')
-        self._metrics[mode]['rollout/skipped_generation_step'].append(1)
-        return rollout_batch, rewards_per_func, True
-
-    def _log_invalid_skip_metrics(self):
-        """Log a wandb metric when a generation step is skipped due to all-invalid groups."""
-        mode = 'train' if self.unwrapped_models[0].training else 'eval'
-        if 'rollout/skipped_generation_step' not in self._metrics[mode]:
-            self._metrics[mode]['rollout/skipped_generation_step'].append(1)
+        for i, sample in enumerate(rollout_batch):
+            info = sample.get('rollout_infos') or {}
+            if not info.get('reward_valid', True):
+                rewards_per_func[i, :] = float('nan')
+        return rewards_per_func
 
     def _maybe_compute_logps(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         seq_lengths = batch['seq_lengths']
