@@ -255,12 +255,24 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             for _ in range(num_iters_per_step):
                 rollout_batch.extend(next(data_iterator))
             micro_batch_data = self._generate_and_score_completions(rollout_batch)
-            num_mini_batch = self.global_batch_size // (self.micro_batch_size * mpu.get_data_parallel_world_size())
-            mini_batch_data = [
-                micro_batch_data[i:i + num_mini_batch] for i in range(0, len(micro_batch_data), num_mini_batch)
-            ]
-            assert len(mini_batch_data) == self.steps_per_generation
-            self._buffered_inputs = mini_batch_data
+
+            if not micro_batch_data:
+                # Generation step skipped (all groups invalid after retries)
+                logger.warning('Skipping generation step: no valid prompt groups after refill retries.')
+                self._log_invalid_skip_metrics()
+                # Reuse previous buffered inputs if available; otherwise pull next batch
+                if self._buffered_inputs is None:
+                    self._step += 1
+                    return self._replace_data_iterator(data_iterator)
+
+            else:
+                num_mini_batch = self.global_batch_size // (self.micro_batch_size * mpu.get_data_parallel_world_size())
+                mini_batch_data = [
+                    micro_batch_data[i:i + num_mini_batch] for i in range(0, len(micro_batch_data), num_mini_batch)
+                ]
+                assert len(mini_batch_data) == self.steps_per_generation
+                self._buffered_inputs = mini_batch_data
+
         inputs = self._buffered_inputs[self._step % self.steps_per_generation]
         self._step += 1
         return RerunDataIterator(iter(inputs))
@@ -392,6 +404,11 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         rewards_per_func = self._score_completions(rollout_batch)
 
+        # Exclude prompt groups with invalid rollouts and refill with fresh data
+        rollout_batch, rewards_per_func, skipped = self._invalid_group_refill(rollout_batch, rewards_per_func)
+        if skipped:
+            return []
+
         # Dynamic sampling for std=0 groups (DAPO)
         if self.dynamic_sample:
             rollout_batch, rewards_per_func = self._dynamic_sampling(rollout_batch, rewards_per_func)
@@ -511,7 +528,12 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             rollout_outputs = self._colocate_rollout(batch, request_config)
         # log prompt and completions
         messages = gather_object([data['messages'] for data in batch])
-        completions = gather_object([data.response.choices[0].message.content for data in rollout_outputs])
+        # Use completion_summary from rollout_infos (multi-turn), falling back to last turn content
+        completions = gather_object([
+            (data.rollout_infos or {}).get("completion_summary")
+            or data.response.choices[0].message.content
+            for data in rollout_outputs
+        ])
         self._logs['prompt'].extend(self._apply_chat_template_to_messages_list(messages))
         self._logs['completion'].extend(completions)
 
@@ -947,6 +969,136 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             rollout_batch, rewards_per_func = origin_data
 
         return rollout_batch, rewards_per_func
+
+    def _invalid_group_refill(
+        self,
+        rollout_batch: DataType,
+        rewards_per_func: torch.Tensor,
+    ) -> Tuple[DataType, torch.Tensor, bool]:
+        """Exclude prompt groups containing invalid rollouts and refill with fresh data.
+
+        Unlike dynamic_sample (DAPO) which replaces zero-variance groups, this targets
+        invalid rollouts (infrastructure failures, zero-turn, judge errors) — missing
+        data that should not be trained on at all.
+
+        Returns:
+            (rollout_batch, rewards_per_func, skipped) where skipped=True means
+            the entire generation step should be skipped.
+        """
+        mode = 'train' if self.unwrapped_models[0].training else 'eval'
+        num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
+
+        resample_count = 0
+        valid_samples = []
+        valid_rewards_per_func = []
+        n_total_groups = 0
+        n_resampled = 0
+
+        while resample_count <= self.max_resample_times:
+            # Gather across rollout group to get global view
+            global_rollout_batch = gather_object(rollout_batch)
+            global_rewards_per_func = gather(rewards_per_func)
+
+            n_samples = len(global_rollout_batch)
+            n_groups = n_samples // num_generations
+            if resample_count == 0:
+                n_total_groups = n_groups
+
+            # Build per-sample validity mask from rollout_infos
+            validity_flags = []
+            for sample in global_rollout_batch:
+                info = sample.get('rollout_infos') or {}
+                validity_flags.append(info.get('reward_valid', True))
+
+            # A prompt group is invalid if ANY generation in the group is invalid
+            group_valid = []
+            for g in range(n_groups):
+                start = g * num_generations
+                end = start + num_generations
+                group_valid.append(all(validity_flags[start:end]))
+
+            # Collect valid groups
+            for g in range(n_groups):
+                if group_valid[g]:
+                    start = g * num_generations
+                    end = start + num_generations
+                    valid_samples.extend(global_rollout_batch[start:end])
+                    valid_rewards_per_func.append(global_rewards_per_func[start:end])
+
+            n_invalid = sum(1 for v in group_valid if not v)
+
+            if len(valid_samples) >= self.generation_batch_size or n_invalid == 0:
+                break
+
+            if resample_count >= self.max_resample_times:
+                break
+
+            n_resampled += n_invalid
+            n_groups_needed = (self.generation_batch_size - len(valid_samples)) // num_generations
+            if n_groups_needed <= 0:
+                break
+
+            logger.info(f'Invalid group refill: {n_invalid}/{n_groups} groups invalid, '
+                        f'{len(valid_samples)}/{self.generation_batch_size} valid so far, '
+                        f'resampling {n_groups_needed} groups (attempt {resample_count + 1})')
+
+            # Lazy init resample iterator (shared with dynamic_sample)
+            if not hasattr(self, 'resample_data_iterator') or self.resample_data_iterator is None:
+                self.resample_data_iterator = self._init_resample_data_iterator()[0]
+
+            # Pull fresh prompts for n_groups_needed groups
+            n_prompts_needed = n_groups_needed
+            next_rollout_prompt_batch = []
+            # Each iterator step yields per_device_generation_batch_size / num_generations prompts
+            num_iters_per_step = self.get_num_iters_per_step()
+            for _ in range(num_iters_per_step):
+                next_rollout_prompt_batch.extend(next(self.resample_data_iterator))
+            next_rollout_prompt_batch = next_rollout_prompt_batch[:n_prompts_needed]
+
+            if self.truncation_strategy == 'delete':
+                next_rollout_prompt_batch = self.resample_encode_failed_inputs(next_rollout_prompt_batch)
+
+            rollout_batch = self.get_local_rollout_batch(next_rollout_prompt_batch)
+            rollout_batch = self._generate_completions(rollout_batch)
+            rewards_per_func = self._score_completions(rollout_batch)
+            resample_count += 1
+
+        # Log metrics
+        n_valid_groups = len(valid_samples) // num_generations if num_generations > 0 else 0
+        n_invalid_groups = n_total_groups - n_valid_groups + n_resampled
+        self._metrics[mode]['rollout/invalid_group_frac'].append(
+            n_invalid_groups / max(n_total_groups + n_resampled, 1))
+        self._metrics[mode]['rollout/resampled_group_frac'].append(
+            n_resampled / max(n_total_groups, 1))
+        self._metrics[mode]['rollout/valid_group_count'].append(n_valid_groups)
+
+        if len(valid_samples) >= self.generation_batch_size:
+            rank = self.process_index
+            per_device_batch_size = self.per_device_generation_batch_size
+            data_slice = slice(rank * per_device_batch_size, (rank + 1) * per_device_batch_size)
+            rollout_batch = valid_samples[:self.generation_batch_size][data_slice]
+            rewards_per_func = torch.cat(valid_rewards_per_func)[:self.generation_batch_size][data_slice]
+            return rollout_batch, rewards_per_func, False
+
+        if valid_samples:
+            # Partial batch — use what we have, padded to local slice
+            rank = self.process_index
+            per_device_batch_size = self.per_device_generation_batch_size
+            data_slice = slice(rank * per_device_batch_size, (rank + 1) * per_device_batch_size)
+            rollout_batch = valid_samples[data_slice]
+            rewards_per_func = torch.cat(valid_rewards_per_func)[data_slice] if valid_rewards_per_func else rewards_per_func[:0]
+            if rollout_batch:
+                return rollout_batch, rewards_per_func, False
+
+        logger.warning(f'No valid prompt groups after {resample_count} refill attempts. Skipping generation step.')
+        self._metrics[mode]['rollout/skipped_generation_step'].append(1)
+        return rollout_batch, rewards_per_func, True
+
+    def _log_invalid_skip_metrics(self):
+        """Log a wandb metric when a generation step is skipped due to all-invalid groups."""
+        mode = 'train' if self.unwrapped_models[0].training else 'eval'
+        if 'rollout/skipped_generation_step' not in self._metrics[mode]:
+            self._metrics[mode]['rollout/skipped_generation_step'].append(1)
 
     def _maybe_compute_logps(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         seq_lengths = batch['seq_lengths']
@@ -1415,9 +1567,12 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 'num_turns': [info.get('num_turns', 0) for info in infos_list],
                 'total_reward': [info.get('total_reward', 0.0) for info in infos_list],
                 'project_id': [info.get('project_id', '') for info in infos_list],
-                'trace_json': [json.dumps(info.get('trace', []), default=str) for info in infos_list],
             }
-            self.jsonl_writer.append(table)
+            # Full trace only in JSONL (too large for wandb table)
+            jsonl_table = {**table, 'trace_json': [
+                json.dumps(info.get('trace', []), default=str) for info in infos_list
+            ]}
+            self.jsonl_writer.append(jsonl_table)
             args = self.args
             if 'wandb' in args.report_to:
                 import wandb
