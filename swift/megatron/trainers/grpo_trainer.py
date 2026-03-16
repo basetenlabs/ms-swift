@@ -58,10 +58,9 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self._train_dataset = None
 
     def train(self, train_dataset, val_dataset):
-        # Store dataset provider for lazy resample iterator initialization
-        # Used by both dynamic_sample and truncation_strategy='delete'
-        if self.dynamic_sample or self.truncation_strategy == 'delete':
-            self._train_dataset = train_dataset
+        # Store dataset for lazy resample iterator initialization
+        # Used by dynamic_sample, truncation_strategy='delete', and invalid group refill
+        self._train_dataset = train_dataset
         super().train(train_dataset, val_dataset)
 
     def _init_grpo_params(self):
