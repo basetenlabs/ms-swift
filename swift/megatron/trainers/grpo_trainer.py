@@ -1386,8 +1386,10 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             completion_mask = completion_mask & off_policy_seq_mask_expanded
 
         if self.loss_type in ['grpo', 'sapo']:
-            # Per-sample mean, then batch mean
-            loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
+            # Normalize by max completion length in batch so short completions
+            # don't get inflated gradients relative to long ones
+            max_len = completion_mask.sum(-1).max().clamp(min=1.0)
+            loss = ((per_token_loss * completion_mask).sum(-1) / max_len).mean()
         elif self.loss_type == 'bnpo':
             loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
         elif self.loss_type == 'dr_grpo':
