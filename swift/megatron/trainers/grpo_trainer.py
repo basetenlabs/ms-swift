@@ -369,10 +369,13 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         total_batch = gather_object(rollout_batch, group=rollout_group)
 
         # Compute message hashes BEFORE token replacement mutates messages
+        # Store in a side map (NOT in sample dicts) to avoid leaking into
+        # extra_kwargs -> data collator -> model(**inputs)
         import hashlib, json as _json
-        for sample in total_batch:
+        pre_replace_msg_hashes = {}
+        for i, sample in enumerate(total_batch):
             msgs = sample.get('messages', [])
-            sample['_pre_replace_msg_hash'] = hashlib.sha256(
+            pre_replace_msg_hashes[i] = hashlib.sha256(
                 _json.dumps(msgs, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
         total_batch = self._maybe_replace_response_token(total_batch)
@@ -392,7 +395,7 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 mini_batch_data.append(encoded_batch_data)
 
         # Token verification: compare trainer-encoded token counts against inference-side counts
-        self._log_token_verification(mini_batch_data, total_batch)
+        self._log_token_verification(mini_batch_data, total_batch, pre_replace_msg_hashes)
 
         # Step 2: Compute KL from logps if kl_in_reward is enabled
         kl_values = None
@@ -1048,7 +1051,8 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         return batch
 
-    def _log_token_verification(self, mini_batch_data: List[Dict[str, Any]], total_batch: List[Dict]) -> None:
+    def _log_token_verification(self, mini_batch_data: List[Dict[str, Any]], total_batch: List[Dict],
+                                pre_replace_msg_hashes: Optional[Dict[int, str]] = None) -> None:
         """Log diagnostic metrics to detect train-vs-inference token/logprob mismatches.
 
         Verification levels:
@@ -1106,7 +1110,7 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
                 # --- 1. Exact message verification across scheduler and trainer ---
                 inference_messages_hash = info.get('inference_messages_hash')
-                trainer_messages_hash = sample.get('_pre_replace_msg_hash')
+                trainer_messages_hash = (pre_replace_msg_hashes or {}).get(sample_idx - 1)
                 if inference_messages_hash and trainer_messages_hash:
                     message_hash_total += 1
                     if trainer_messages_hash != inference_messages_hash:
