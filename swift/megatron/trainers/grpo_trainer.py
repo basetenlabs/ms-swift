@@ -749,6 +749,11 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         # NOTE: In GDPO mode, this weighted sum is only used for logging metrics.
         # GDPO advantages are computed separately in the scale_rewards=='gdpo' branch below.
         rewards = (total_rewards_per_func * self.reward_weights.unsqueeze(0)).nansum(dim=1)
+        # nansum treats NaN as 0, so invalid rollouts (all-NaN from _mask_invalid_rollouts)
+        # silently become reward=0 instead of staying NaN. Restore NaN so nanmean/nanstd
+        # in advantage computation correctly excludes them.
+        all_nan_mask = torch.isnan(total_rewards_per_func).all(dim=1)
+        rewards[all_nan_mask] = float('nan')
 
         # Apply KL penalty to rewards if kl_in_reward is enabled
         if self.kl_in_reward and self.beta != 0.0 and kl_values is not None:
@@ -947,6 +952,9 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             # Compute reward std for the entire global batch
             # We need to compute std on the gathered data to get a global mask
             global_rewards = (global_rewards_per_func * self.reward_weights.unsqueeze(0)).nansum(dim=1)
+            # Restore NaN for invalid rollouts (same fix as _compute_advantages)
+            all_nan_mask = torch.isnan(global_rewards_per_func).all(dim=1)
+            global_rewards[all_nan_mask] = float('nan')
             mode = 'train' if self.unwrapped_models[0].training else 'eval'
             num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
             grouped_rewards = global_rewards.view(-1, num_generations)
