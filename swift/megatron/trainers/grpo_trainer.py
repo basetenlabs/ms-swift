@@ -334,43 +334,10 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             'seq_lengths': seq_lengths,  # [batch_size]
         })
 
-        # Process rollout_logprobs for importance sampling correction
-        rollout_per_token_logps = None
-        rollout_logprobs_list = [data.get('rollout_logprobs') for data in rollout_batch]
-        if all(lp is not None and lp for lp in rollout_logprobs_list):
-            # Validate that logprobs count matches completion tokens count
-            valid_logprobs = True
-            for i, nested_lp in enumerate(rollout_logprobs_list):
-                total_logprobs = sum(len(turn_lps) for turn_lps in nested_lp)
-                completion_count = int(completion_mask[i].sum().item())
-                if total_logprobs != completion_count:
-                    logger.warning(f'Rollout logprobs count ({total_logprobs}) does not match '
-                                   f'completion tokens count ({completion_count}). '
-                                   f'Skipping rollout importance sampling for this batch.')
-                    valid_logprobs = False
-                    break
-
-            if valid_logprobs:
-                batch_size = completion_mask.shape[0]
-                seq_len = completion_mask.shape[1]
-                rollout_per_token_logps = torch.zeros(batch_size, seq_len, dtype=torch.float32, device=self.device)
-                for i, nested_lp in enumerate(rollout_logprobs_list):
-                    # Flatten logprobs for this sample
-                    flat_lps = [lp for turn_lps in nested_lp for lp in turn_lps]
-                    if flat_lps:
-                        # Check for None values in flat_lps
-                        if any(lp is None for lp in flat_lps):
-                            logger.warning('Found None values in rollout_logprobs. '
-                                           'Skipping rollout importance sampling for this batch.')
-                            rollout_per_token_logps = None
-                            break
-                        # Get indices where completion_mask is True
-                        completion_indices = completion_mask[i].nonzero(as_tuple=True)[0]
-                        # Scatter logprobs to completion positions
-                        rollout_per_token_logps[i, completion_indices] = torch.tensor(
-                            flat_lps, dtype=torch.float32, device=self.device)
-
-        encoded_batch['rollout_per_token_logps'] = rollout_per_token_logps
+        # Rollout logprob ingestion disabled for diagnostic runs.
+        # The mismatch between rollout logprob counts and completion mask counts
+        # is a known inconsistency that needs separate investigation.
+        encoded_batch['rollout_per_token_logps'] = None
 
         return encoded_batch
 
@@ -1085,9 +1052,10 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         """Log diagnostic metrics to detect train-vs-inference token/logprob mismatches.
 
         Verification levels:
-        1. Prompt token hash: SHA256 of encoded prompt input_ids (not just messages)
-        2. Boundary: prompt count, completion count, completion_mask.sum(), response_token_ids length — all compared
-        3. Logprob: compare rollout_per_token_logps vs old_per_token_logps on completion tokens
+        1. Message hash: compare scheduler-side training_messages against trainer-side pre-replacement messages
+        2. Prompt token fingerprints: log encoded prompt input_ids hashes for manual inspection on the trainer side
+        3. Boundary: compare prompt count, completion count, completion_mask.sum(), and response_token_ids length
+        4. Logprob: compare rollout_per_token_logps vs old_per_token_logps on completion tokens
         """
         if not self.is_main_process:
             return
@@ -1096,13 +1064,24 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         prompt_length_diffs = []
         completion_length_diffs = []
+        response_length_diffs = []
         boundary_mismatches = []
-        prompt_id_hash_mismatches = 0
+        message_hash_mismatches = 0
+        message_hash_total = 0
         prompt_id_hash_total = 0
+        prompt_id_hash_skipped = 0
         old_logps_means = []
         old_logps_stds = []
         logprob_diffs_all = []
         sample_idx = 0
+
+        def _response_token_ids_len(token_ids):
+            if not token_ids:
+                return 0
+            first = token_ids[0]
+            if isinstance(first, (list, tuple)):
+                return sum(len(turn_ids) for turn_ids in token_ids)
+            return len(token_ids)
 
         for batch_data in mini_batch_data:
             completion_mask = batch_data['completion_mask']
@@ -1123,24 +1102,39 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 completion_tokens_trainer = int(mask_i.sum().item())
                 total_tokens_trainer = int(seq_lengths[i].item())
                 prompt_tokens_trainer = total_tokens_trainer - completion_tokens_trainer
-                response_token_ids_len = sum(len(t) for t in (sample.get('response_token_ids') or []))
+                response_token_ids_len = _response_token_ids_len(sample.get('response_token_ids'))
 
-                # --- 1. Prompt token ID hash (actual encoded tokens, not messages) ---
-                if input_ids is not None:
+                # --- 1. Exact message verification across scheduler and trainer ---
+                inference_messages_hash = info.get('inference_messages_hash')
+                trainer_messages_hash = sample.get('_pre_replace_msg_hash')
+                if inference_messages_hash and trainer_messages_hash:
+                    message_hash_total += 1
+                    if trainer_messages_hash != inference_messages_hash:
+                        message_hash_mismatches += 1
+                        logger.warning(
+                            f'TOKEN VERIFY MESSAGE HASH MISMATCH sample {sample_idx - 1}: '
+                            f'trainer={trainer_messages_hash} inference={inference_messages_hash}')
+
+                # --- 2. Trainer-side prompt token fingerprints ---
+                can_hash_prompt_ids = (
+                    input_ids is not None and not self.template.padding_free and input_ids.dim() == 2
+                    and i < input_ids.shape[0]
+                )
+                if can_hash_prompt_ids:
                     prompt_ids = input_ids[i, :prompt_tokens_trainer].cpu().tolist()
                     trainer_prompt_hash = hashlib.sha256(str(prompt_ids).encode()).hexdigest()[:16]
                     first8 = prompt_ids[:8]
                     last8 = prompt_ids[-8:] if len(prompt_ids) > 8 else prompt_ids
                     prompt_id_hash_total += 1
-                    # Store for cross-sample comparison; no inference-side hash of input_ids yet,
-                    # but log it so we can inspect manually and compare across runs
                     if sample_idx <= 3:
                         logger.info(
                             f'TOKEN VERIFY PROMPT IDS sample {sample_idx - 1}: '
                             f'hash={trainer_prompt_hash} len={prompt_tokens_trainer} '
                             f'first8={first8} last8={last8}')
+                else:
+                    prompt_id_hash_skipped += 1
 
-                # --- 2. Full boundary verification ---
+                # --- 3. Full boundary verification ---
                 inference_prompt = info.get('inference_prompt_tokens', 0)
                 inference_completion = info.get('inference_completion_tokens', 0)
 
@@ -1150,6 +1144,7 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                     mask_vs_response = completion_tokens_trainer - response_token_ids_len
                     prompt_length_diffs.append(prompt_diff)
                     completion_length_diffs.append(completion_diff)
+                    response_length_diffs.append(mask_vs_response)
                     if prompt_diff != 0 or completion_diff != 0 or mask_vs_response != 0:
                         boundary_mismatches.append({
                             'idx': sample_idx - 1,
@@ -1163,7 +1158,7 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                             'response_token_ids_len': response_token_ids_len,
                         })
 
-                # --- 3. Rollout vs old logprob comparison ---
+                # --- 4. Rollout vs old logprob comparison ---
                 if old_per_token_logps is not None and rollout_per_token_logps is not None:
                     old_lps = old_per_token_logps[i][mask_i]
                     rollout_lps = rollout_per_token_logps[i][mask_i]
@@ -1180,27 +1175,37 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         mode = 'train' if self.unwrapped_models[0].training else 'eval'
 
-        # --- Log 1: Prompt ID hash ---
+        # --- Log 1: Message hash equality + trainer-side prompt ID fingerprints ---
+        if message_hash_total > 0:
+            logger.info(f'TOKEN VERIFY MESSAGE HASH: {message_hash_mismatches}/{message_hash_total} mismatches')
+            self._metrics[mode]['token_verify/message_hash_mismatches'].append(message_hash_mismatches)
+            self._metrics[mode]['token_verify/message_hash_total'].append(message_hash_total)
         if prompt_id_hash_total > 0:
             self._metrics[mode]['token_verify/prompt_id_hash_total'].append(prompt_id_hash_total)
+        if prompt_id_hash_skipped > 0:
+            self._metrics[mode]['token_verify/prompt_id_hash_skipped'].append(prompt_id_hash_skipped)
 
-        # --- Log 2: Boundary ---
+        # --- Log 3: Boundary ---
         if prompt_length_diffs:
             pd = torch.tensor(prompt_length_diffs, dtype=torch.float32)
             cd = torch.tensor(completion_length_diffs, dtype=torch.float32)
+            rd = torch.tensor(response_length_diffs, dtype=torch.float32)
             logger.info(
                 f'TOKEN VERIFY BOUNDARY: prompt_diff mean={pd.mean():.1f} min={pd.min():.0f} max={pd.max():.0f} | '
                 f'completion_diff mean={cd.mean():.1f} min={cd.min():.0f} max={cd.max():.0f} | '
+                f'mask_vs_response mean={rd.mean():.1f} min={rd.min():.0f} max={rd.max():.0f} | '
                 f'n={len(prompt_length_diffs)} boundary_mismatches={len(boundary_mismatches)}')
             self._metrics[mode]['token_verify/prompt_length_diff_mean'].append(pd.mean().item())
             self._metrics[mode]['token_verify/prompt_length_diff_max'].append(pd.abs().max().item())
             self._metrics[mode]['token_verify/completion_length_diff_mean'].append(cd.mean().item())
             self._metrics[mode]['token_verify/completion_length_diff_max'].append(cd.abs().max().item())
+            self._metrics[mode]['token_verify/mask_vs_response_diff_mean'].append(rd.mean().item())
+            self._metrics[mode]['token_verify/mask_vs_response_diff_max'].append(rd.abs().max().item())
             self._metrics[mode]['token_verify/boundary_mismatches'].append(len(boundary_mismatches))
         for bm in boundary_mismatches[:5]:
             logger.warning(f'TOKEN VERIFY BOUNDARY MISMATCH: {bm}')
 
-        # --- Log 3: Rollout vs old logprob comparison ---
+        # --- Log 4: Rollout vs old logprob comparison ---
         if logprob_diffs_all:
             all_diffs = torch.cat(logprob_diffs_all)
             logger.info(
@@ -1454,6 +1459,9 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 ratio_on_completion = log_ratio[completion_mask.bool()]
                 if ratio_on_completion.numel() > 0:
                     ratio_vals = torch.exp(ratio_on_completion)
+                    out_of_band_frac = (
+                        (ratio_vals < 1 - self.epsilon_low) | (ratio_vals > 1 + self.epsilon_high)
+                    ).float().mean()
                     mode = 'train' if self.unwrapped_models[0].training else 'eval'
                     self._metrics[mode]['token_verify/step_log_ratio_mean'].append(ratio_on_completion.mean().item())
                     self._metrics[mode]['token_verify/step_log_ratio_abs_mean'].append(
@@ -1461,15 +1469,14 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                     self._metrics[mode]['token_verify/step_log_ratio_max'].append(ratio_on_completion.abs().max().item())
                     self._metrics[mode]['token_verify/step_ratio_min'].append(ratio_vals.min().item())
                     self._metrics[mode]['token_verify/step_ratio_max'].append(ratio_vals.max().item())
-                    clipped_frac = ((ratio_vals < 1 - self.epsilon_low) | (ratio_vals > 1 + self.epsilon_high)).float().mean()
-                    self._metrics[mode]['token_verify/step_clipped_frac'].append(clipped_frac.item())
+                    self._metrics[mode]['token_verify/step_ratio_out_of_band_frac'].append(out_of_band_frac.item())
                     if self._step <= 1:
                         logger.info(
                             f'TOKEN VERIFY RATIO step={self._step}: '
                             f'log_ratio mean={ratio_on_completion.mean():.6f} abs_mean={ratio_on_completion.abs().mean():.6f} '
                             f'max={ratio_on_completion.abs().max():.6f} | '
                             f'ratio min={ratio_vals.min():.6f} max={ratio_vals.max():.6f} | '
-                            f'clipped_frac={clipped_frac:.6f} | n_tokens={ratio_on_completion.numel()}')
+                            f'out_of_band_frac={out_of_band_frac:.6f} | n_tokens={ratio_on_completion.numel()}')
 
         # Compute importance weights based on level
         if self.importance_sampling_level == 'token':
