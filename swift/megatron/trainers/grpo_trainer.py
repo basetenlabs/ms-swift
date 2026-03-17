@@ -1762,13 +1762,12 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
     @contextmanager
     def _template_context(self, template: Template):
-        # The max_length for prompt and completion has already been restricted, so there is no need for max_length here.
-        max_length = template.max_length
-        template.max_length = None
-        try:
-            yield
-        finally:
-            template.max_length = max_length
+        # Keep template.max_length enabled so oversized sequences from multi-turn
+        # rollouts get truncated before reaching the forward pass. The original
+        # code set template.max_length = None assuming "max_length has already been
+        # restricted", but in multi-turn GRPO cumulative completion tokens can
+        # exceed max_length, causing training OOM.
+        yield
 
     def _prepare_metrics(self):
         args = self.args
