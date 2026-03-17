@@ -416,6 +416,9 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                     encoded_batch_data = self._maybe_compute_logps(encoded_batch_data)
                 mini_batch_data.append(encoded_batch_data)
 
+        # Token verification: compare trainer-encoded token counts against inference-side counts
+        self._log_token_verification(mini_batch_data, total_batch)
+
         # Step 2: Compute KL from logps if kl_in_reward is enabled
         kl_values = None
         if self.kl_in_reward and self.beta != 0.0:
@@ -1069,6 +1072,91 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         batch['old_per_token_logps'] = old_per_token_logps
 
         return batch
+
+    def _log_token_verification(self, mini_batch_data: List[Dict[str, Any]], total_batch: List[Dict]) -> None:
+        """Log diagnostic metrics comparing trainer-encoded tokens against inference-side counts.
+
+        For each sample, computes:
+        - prompt_length = total seq_length - completion tokens (from completion_mask)
+        - completion_length = completion tokens (from completion_mask)
+        Then compares against inference_prompt_tokens / inference_completion_tokens from rollout_infos.
+        Also logs old_per_token_logps statistics for visibility.
+        """
+        if not self.is_main_process:
+            return
+
+        prompt_length_diffs = []
+        completion_length_diffs = []
+        old_logps_means = []
+        old_logps_stds = []
+        sample_idx = 0
+
+        for batch_data in mini_batch_data:
+            completion_mask = batch_data['completion_mask']  # [batch_size, max_seq_len]
+            seq_lengths = batch_data['seq_lengths']  # [batch_size]
+            num_samples = batch_data['num_samples']
+            old_per_token_logps = batch_data.get('old_per_token_logps')
+
+            for i in range(num_samples):
+                if sample_idx >= len(total_batch):
+                    break
+                sample = total_batch[sample_idx]
+                info = sample.get('rollout_infos') or {}
+                sample_idx += 1
+
+                # Trainer-side token counts
+                completion_tokens_trainer = int(completion_mask[i].sum().item())
+                total_tokens_trainer = int(seq_lengths[i].item())
+                prompt_tokens_trainer = total_tokens_trainer - completion_tokens_trainer
+
+                # Inference-side token counts (summed across all turns)
+                inference_prompt = info.get('inference_prompt_tokens', 0)
+                inference_completion = info.get('inference_completion_tokens', 0)
+
+                if inference_prompt > 0 or inference_completion > 0:
+                    prompt_length_diffs.append(prompt_tokens_trainer - inference_prompt)
+                    completion_length_diffs.append(completion_tokens_trainer - inference_completion)
+
+                # old_logps per-sample stats
+                if old_per_token_logps is not None:
+                    mask_i = completion_mask[i].bool()
+                    logps_i = old_per_token_logps[i][mask_i]
+                    if logps_i.numel() > 0:
+                        old_logps_means.append(logps_i.mean().item())
+                        old_logps_stds.append(logps_i.std().item() if logps_i.numel() > 1 else 0.0)
+
+        # Log summary
+        if prompt_length_diffs:
+            diffs_t = torch.tensor(prompt_length_diffs, dtype=torch.float32)
+            comp_diffs_t = torch.tensor(completion_length_diffs, dtype=torch.float32)
+            logger.info(
+                f'TOKEN VERIFY: prompt_diff mean={diffs_t.mean():.1f} std={diffs_t.std():.1f} '
+                f'min={diffs_t.min():.0f} max={diffs_t.max():.0f} | '
+                f'completion_diff mean={comp_diffs_t.mean():.1f} std={comp_diffs_t.std():.1f} '
+                f'min={comp_diffs_t.min():.0f} max={comp_diffs_t.max():.0f} | '
+                f'n={len(prompt_length_diffs)}')
+
+        if old_logps_means:
+            means_t = torch.tensor(old_logps_means, dtype=torch.float32)
+            stds_t = torch.tensor(old_logps_stds, dtype=torch.float32)
+            logger.info(
+                f'TOKEN VERIFY old_logps: mean={means_t.mean():.4f} std={stds_t.mean():.4f} '
+                f'min_mean={means_t.min():.4f} max_mean={means_t.max():.4f} | n={len(old_logps_means)}')
+
+        # Store for wandb logging via _metrics
+        mode = 'train' if self.unwrapped_models[0].training else 'eval'
+        if prompt_length_diffs:
+            diffs_t = torch.tensor(prompt_length_diffs, dtype=torch.float32)
+            comp_diffs_t = torch.tensor(completion_length_diffs, dtype=torch.float32)
+            self._metrics[mode]['token_verify/prompt_length_diff_mean'].append(diffs_t.mean().item())
+            self._metrics[mode]['token_verify/prompt_length_diff_max'].append(diffs_t.abs().max().item())
+            self._metrics[mode]['token_verify/completion_length_diff_mean'].append(comp_diffs_t.mean().item())
+            self._metrics[mode]['token_verify/completion_length_diff_max'].append(comp_diffs_t.abs().max().item())
+        if old_logps_means:
+            means_t = torch.tensor(old_logps_means, dtype=torch.float32)
+            stds_t = torch.tensor(old_logps_stds, dtype=torch.float32)
+            self._metrics[mode]['token_verify/old_logps_mean'].append(means_t.mean().item())
+            self._metrics[mode]['token_verify/old_logps_std'].append(stds_t.mean().item())
 
     def _compute_kl_from_batches(self, mini_batch_data: List[Dict[str, Any]]) -> torch.Tensor:
         """
