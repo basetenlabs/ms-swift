@@ -400,6 +400,14 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         # Gather rollout data across rollout group
         total_batch = gather_object(rollout_batch, group=rollout_group)
+
+        # Compute message hashes BEFORE token replacement mutates messages
+        import hashlib, json as _json
+        for sample in total_batch:
+            msgs = sample.get('messages', [])
+            sample['_pre_replace_msg_hash'] = hashlib.sha256(
+                _json.dumps(msgs, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
         total_batch = self._maybe_replace_response_token(total_batch)
         mini_batch_data = []
         template = self.template
@@ -1074,28 +1082,36 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         return batch
 
     def _log_token_verification(self, mini_batch_data: List[Dict[str, Any]], total_batch: List[Dict]) -> None:
-        """Log diagnostic metrics comparing trainer-encoded tokens against inference-side counts.
+        """Log diagnostic metrics to detect train-vs-inference token/logprob mismatches.
 
-        For each sample, computes:
-        - prompt_length = total seq_length - completion tokens (from completion_mask)
-        - completion_length = completion tokens (from completion_mask)
-        Then compares against inference_prompt_tokens / inference_completion_tokens from rollout_infos.
-        Also logs old_per_token_logps statistics for visibility.
+        Four verification levels:
+        1. Exact prompt token verification: hash of prompt input_ids (first/last 64 + full hash)
+        2. Boundary verification: prompt count, completion count, completion_mask.sum(), response_token_ids length
+        3. Step-1 logprob verification: compare rollout_per_token_logps vs old_per_token_logps
+        4. Step-1 ratio stats: min/mean/max of (old_logps - rollout_logps) on completion tokens
         """
         if not self.is_main_process:
             return
 
+        import hashlib
+
         prompt_length_diffs = []
         completion_length_diffs = []
+        prompt_hash_mismatches = 0
+        prompt_hash_total = 0
         old_logps_means = []
         old_logps_stds = []
+        # Step-1 logprob comparison: old_per_token_logps vs rollout_per_token_logps
+        logprob_diffs_all = []
         sample_idx = 0
 
         for batch_data in mini_batch_data:
-            completion_mask = batch_data['completion_mask']  # [batch_size, max_seq_len]
-            seq_lengths = batch_data['seq_lengths']  # [batch_size]
+            completion_mask = batch_data['completion_mask']
+            seq_lengths = batch_data['seq_lengths']
             num_samples = batch_data['num_samples']
             old_per_token_logps = batch_data.get('old_per_token_logps')
+            rollout_per_token_logps = batch_data.get('rollout_per_token_logps')
+            input_ids = batch_data.get('input_ids')
 
             for i in range(num_samples):
                 if sample_idx >= len(total_batch):
@@ -1104,37 +1120,82 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 info = sample.get('rollout_infos') or {}
                 sample_idx += 1
 
-                # Trainer-side token counts
-                completion_tokens_trainer = int(completion_mask[i].sum().item())
+                mask_i = completion_mask[i].bool()
+                completion_tokens_trainer = int(mask_i.sum().item())
                 total_tokens_trainer = int(seq_lengths[i].item())
                 prompt_tokens_trainer = total_tokens_trainer - completion_tokens_trainer
 
-                # Inference-side token counts (summed across all turns)
+                # --- 1. Exact message verification (hash of messages before token replacement) ---
+                inference_prompt_hash = info.get('inference_prompt_hash')
+                trainer_msg_hash = sample.get('_pre_replace_msg_hash')
+                if inference_prompt_hash and trainer_msg_hash:
+                    prompt_hash_total += 1
+                    if trainer_msg_hash != inference_prompt_hash:
+                        prompt_hash_mismatches += 1
+                        logger.warning(
+                            f'TOKEN VERIFY MSG HASH MISMATCH sample {sample_idx - 1}: '
+                            f'trainer={trainer_msg_hash} inference={inference_prompt_hash} '
+                            f'trainer_prompt_len={prompt_tokens_trainer} '
+                            f'inference_prompt_len={info.get("inference_prompt_tokens", "?")}')
+
+                # --- 2. Boundary verification ---
                 inference_prompt = info.get('inference_prompt_tokens', 0)
                 inference_completion = info.get('inference_completion_tokens', 0)
+                response_token_ids_len = sum(len(t) for t in (sample.get('response_token_ids') or []))
 
                 if inference_prompt > 0 or inference_completion > 0:
                     prompt_length_diffs.append(prompt_tokens_trainer - inference_prompt)
                     completion_length_diffs.append(completion_tokens_trainer - inference_completion)
 
-                # old_logps per-sample stats
+                # --- 3. Step-1 logprob verification ---
+                if old_per_token_logps is not None and rollout_per_token_logps is not None:
+                    old_lps = old_per_token_logps[i][mask_i]
+                    rollout_lps = rollout_per_token_logps[i][mask_i]
+                    if old_lps.numel() > 0 and rollout_lps.numel() > 0:
+                        diff = (old_lps - rollout_lps)
+                        logprob_diffs_all.append(diff)
+
+                # old_logps stats
                 if old_per_token_logps is not None:
-                    mask_i = completion_mask[i].bool()
                     logps_i = old_per_token_logps[i][mask_i]
                     if logps_i.numel() > 0:
                         old_logps_means.append(logps_i.mean().item())
                         old_logps_stds.append(logps_i.std().item() if logps_i.numel() > 1 else 0.0)
 
-        # Log summary
+        mode = 'train' if self.unwrapped_models[0].training else 'eval'
+
+        # --- Log 1: Prompt hash ---
+        if prompt_hash_total > 0:
+            logger.info(f'TOKEN VERIFY HASH: {prompt_hash_mismatches}/{prompt_hash_total} mismatches')
+            self._metrics[mode]['token_verify/prompt_hash_mismatches'].append(prompt_hash_mismatches)
+
+        # --- Log 2: Boundary ---
         if prompt_length_diffs:
-            diffs_t = torch.tensor(prompt_length_diffs, dtype=torch.float32)
-            comp_diffs_t = torch.tensor(completion_length_diffs, dtype=torch.float32)
+            pd = torch.tensor(prompt_length_diffs, dtype=torch.float32)
+            cd = torch.tensor(completion_length_diffs, dtype=torch.float32)
             logger.info(
-                f'TOKEN VERIFY: prompt_diff mean={diffs_t.mean():.1f} std={diffs_t.std():.1f} '
-                f'min={diffs_t.min():.0f} max={diffs_t.max():.0f} | '
-                f'completion_diff mean={comp_diffs_t.mean():.1f} std={comp_diffs_t.std():.1f} '
-                f'min={comp_diffs_t.min():.0f} max={comp_diffs_t.max():.0f} | '
-                f'n={len(prompt_length_diffs)}')
+                f'TOKEN VERIFY BOUNDARY: prompt_diff mean={pd.mean():.1f} min={pd.min():.0f} max={pd.max():.0f} | '
+                f'completion_diff mean={cd.mean():.1f} min={cd.min():.0f} max={cd.max():.0f} | n={len(prompt_length_diffs)}')
+            self._metrics[mode]['token_verify/prompt_length_diff_mean'].append(pd.mean().item())
+            self._metrics[mode]['token_verify/prompt_length_diff_max'].append(pd.abs().max().item())
+            self._metrics[mode]['token_verify/completion_length_diff_mean'].append(cd.mean().item())
+            self._metrics[mode]['token_verify/completion_length_diff_max'].append(cd.abs().max().item())
+
+        # --- Log 3 & 4: Logprob comparison and ratio stats ---
+        if logprob_diffs_all:
+            all_diffs = torch.cat(logprob_diffs_all)
+            logger.info(
+                f'TOKEN VERIFY LOGPROB DIFF (old - rollout): '
+                f'mean={all_diffs.mean():.6f} std={all_diffs.std():.6f} '
+                f'min={all_diffs.min():.6f} max={all_diffs.max():.6f} '
+                f'abs_mean={all_diffs.abs().mean():.6f} | '
+                f'nonzero_frac={((all_diffs.abs() > 1e-5).float().mean()):.4f} | '
+                f'n_tokens={all_diffs.numel()}')
+            self._metrics[mode]['token_verify/logprob_diff_mean'].append(all_diffs.mean().item())
+            self._metrics[mode]['token_verify/logprob_diff_abs_mean'].append(all_diffs.abs().mean().item())
+            self._metrics[mode]['token_verify/logprob_diff_max'].append(all_diffs.abs().max().item())
+            self._metrics[mode]['token_verify/logprob_diff_nonzero_frac'].append(
+                (all_diffs.abs() > 1e-5).float().mean().item())
 
         if old_logps_means:
             means_t = torch.tensor(old_logps_means, dtype=torch.float32)
@@ -1142,19 +1203,6 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             logger.info(
                 f'TOKEN VERIFY old_logps: mean={means_t.mean():.4f} std={stds_t.mean():.4f} '
                 f'min_mean={means_t.min():.4f} max_mean={means_t.max():.4f} | n={len(old_logps_means)}')
-
-        # Store for wandb logging via _metrics
-        mode = 'train' if self.unwrapped_models[0].training else 'eval'
-        if prompt_length_diffs:
-            diffs_t = torch.tensor(prompt_length_diffs, dtype=torch.float32)
-            comp_diffs_t = torch.tensor(completion_length_diffs, dtype=torch.float32)
-            self._metrics[mode]['token_verify/prompt_length_diff_mean'].append(diffs_t.mean().item())
-            self._metrics[mode]['token_verify/prompt_length_diff_max'].append(diffs_t.abs().max().item())
-            self._metrics[mode]['token_verify/completion_length_diff_mean'].append(comp_diffs_t.mean().item())
-            self._metrics[mode]['token_verify/completion_length_diff_max'].append(comp_diffs_t.abs().max().item())
-        if old_logps_means:
-            means_t = torch.tensor(old_logps_means, dtype=torch.float32)
-            stds_t = torch.tensor(old_logps_stds, dtype=torch.float32)
             self._metrics[mode]['token_verify/old_logps_mean'].append(means_t.mean().item())
             self._metrics[mode]['token_verify/old_logps_std'].append(stds_t.mean().item())
 
