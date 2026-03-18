@@ -14,6 +14,7 @@ from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import json
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -328,6 +329,7 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         return RerunDataIterator(iter(inputs))
 
     def _replace_data_iterator_async(self, data_iterator):
+        pipeline_start = time.monotonic()
         replay_item = self._pop_ready_replay_item()
         replay_source = 'async_prefetch'
         if replay_item is None:
@@ -352,6 +354,17 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         if self._async_replay_ready_item is None and self._async_replay_future is None:
             self._schedule_async_replay_prefetch(data_iterator)
+
+        self._record_async_metric('data_pipeline_wall_clock_s', time.monotonic() - pipeline_start)
+        if self.is_main_process:
+            timings = replay_item.get('timings', {})
+            logger.info(
+                f'STEP TIMING: step={self._step} '
+                f'rollout={timings.get("server_rollout_wall_clock_s", 0):.0f}s '
+                f'build={timings.get("replay_item_build_wall_clock_s", 0):.0f}s '
+                f'pipeline={time.monotonic() - pipeline_start:.0f}s '
+                f'source={replay_source} lag={age_steps} '
+                f'samples={len(replay_item["rollout_batch_full"])}')
 
         inputs = self._buffered_inputs[0]
         self._buffered_inputs = None
@@ -403,9 +416,14 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
     def _collect_replay_item_global(self, global_rollout_batch: DataType, behavior_version: int,
                                     created_step: int) -> Dict[str, Any]:
+        build_start = time.monotonic()
         batch = self._preprocess_inputs_local(deepcopy(global_rollout_batch))
         request_config = self._get_request_config()
+
+        rollout_start = time.monotonic()
         outputs = self._server_rollout(batch, request_config, is_global_inputs=True)
+        server_rollout_s = time.monotonic() - rollout_start
+
         if not self.is_main_process:
             raise RuntimeError('_collect_replay_item_global should only run on the main process')
         batch = self.postprocess_rollout_data(batch, outputs)
@@ -426,6 +444,29 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 'rollout_infos': rollout_infos_list,
             }
 
+        rollout_times = [
+            (data.get('rollout_infos') or {}).get('rollout/total_s', 0)
+            for data in batch
+        ]
+        valid_count = sum(
+            1 for data in batch
+            if (data.get('rollout_infos') or {}).get('reward_valid')
+        )
+        invalid_count = len(batch) - valid_count
+        batch_stats = {
+            'rollout_p50_s': float(np.percentile(rollout_times, 50)) if rollout_times else 0.0,
+            'rollout_p90_s': float(np.percentile(rollout_times, 90)) if rollout_times else 0.0,
+            'rollout_p99_s': float(np.percentile(rollout_times, 99)) if rollout_times else 0.0,
+            'rollout_max_s': float(max(rollout_times)) if rollout_times else 0.0,
+            'valid_count': valid_count,
+            'invalid_count': invalid_count,
+            'valid_frac': valid_count / max(len(batch), 1),
+            'deadline_hit': int(any(
+                (data.get('rollout_infos') or {}).get('invalid_reason') == 'batch_deadline'
+                for data in batch
+            )),
+        }
+
         return {
             'replay_id': str(uuid.uuid4().hex),
             'behavior_version': behavior_version,
@@ -437,6 +478,11 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             'num_generations': self.num_generations,
             'generation_batch_size': self.generation_batch_size,
             'log_payload': log_payload,
+            'batch_stats': batch_stats,
+            'timings': {
+                'server_rollout_wall_clock_s': server_rollout_s,
+                'replay_item_build_wall_clock_s': time.monotonic() - build_start,
+            },
         }
 
     def _broadcast_replay_item(self, replay_item: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -479,6 +525,9 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self._record_async_metric('buffer_depth', 1.0)
 
     def _pop_ready_replay_item(self) -> Optional[Dict[str, Any]]:
+        consumer_wait_s = 0.0
+        was_fallback = False
+        had_error = False
         if self._async_replay_ready_item is None and self.is_main_process and self._async_replay_future is not None:
             future = self._async_replay_future
             wait_started = time.monotonic()
@@ -487,13 +536,13 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             except concurrent.futures.TimeoutError:
                 if self.async_replay_fail_open_to_sync and future.cancel():
                     logger.warning('Async replay prefetch timed out before start; falling back to sync generation.')
-                    self._record_async_metric('fallback_sync_count', 1.0)
+                    was_fallback = True
                     replay_item = None
                 else:
                     logger.warning('Async replay prefetch timed out while running; waiting for completion.')
                     replay_item = future.result()
             except Exception as exc:
-                self._record_async_metric('producer_errors', 1.0)
+                had_error = True
                 if self.async_replay_fail_open_to_sync:
                     logger.exception('Async replay prefetch failed; falling back to sync generation.')
                     replay_item = None
@@ -502,11 +551,21 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                     replay_item = {'__async_replay_error__': repr(exc)}
             self._async_replay_future = None
             self._async_replay_ready_item = replay_item
-            self._record_async_metric('consumer_wait_s', time.monotonic() - wait_started)
+            consumer_wait_s = time.monotonic() - wait_started
 
         replay_item = self._async_replay_ready_item if self.is_main_process else None
         replay_item = self._broadcast_replay_item(replay_item)
         self._async_replay_ready_item = None
+
+        # Broadcast producer-side metrics to all ranks before recording
+        wait_list = broadcast_object_list([consumer_wait_s, was_fallback, had_error],
+                                           from_process=self.world_size - 1)
+        self._record_async_metric('consumer_wait_s', wait_list[0])
+        if wait_list[1]:
+            self._record_async_metric('fallback_sync_count', 1.0)
+        if wait_list[2]:
+            self._record_async_metric('producer_errors', 1.0)
+
         if replay_item is not None and '__async_replay_error__' in replay_item:
             raise RuntimeError(replay_item['__async_replay_error__'])
         if replay_item is not None:
@@ -524,6 +583,7 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         return local_rollout_batch, local_rewards
 
     def _prepare_training_batches_from_replay_item(self, replay_item: Dict[str, Any]) -> List[Dict[str, Any]]:
+        prep_start = time.monotonic()
         rollout_group = self._get_rollout_group()
         rollout_batch, rewards_per_func = self._slice_replay_item_for_rank(replay_item)
 
@@ -571,6 +631,16 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             self._logs['prompt'].extend(replay_item['log_payload']['prompt'])
             self._logs['completion'].extend(replay_item['log_payload']['completion'])
             self._logs['rollout_infos'].extend(replay_item['log_payload']['rollout_infos'])
+
+        prep_s = time.monotonic() - prep_start
+        timings = replay_item.get('timings', {})
+        self._record_async_metric('server_rollout_wall_clock_s', timings.get('server_rollout_wall_clock_s', 0.0))
+        self._record_async_metric('replay_item_build_wall_clock_s', timings.get('replay_item_build_wall_clock_s', 0.0))
+        self._record_async_metric('training_prep_wall_clock_s', prep_s)
+
+        batch_stats = replay_item.get('batch_stats', {})
+        for key, value in batch_stats.items():
+            self._record_async_metric(f'batch/{key}', float(value))
 
         return mini_batch_data
 
@@ -1249,6 +1319,14 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         nan_count = torch.isnan(rewards).sum().item()
         total_count = rewards.numel()
         self._metrics[mode]['rollout/nan_masked_frac'].append(nan_count / max(total_count, 1))
+
+        # Group validity metrics
+        nan_mask = torch.isnan(grouped_rewards)
+        all_invalid = nan_mask.all(dim=1)
+        partial_invalid = nan_mask.any(dim=1) & ~all_invalid
+        self._metrics[mode]['batch/prompt_groups_all_invalid'].append(all_invalid.float().mean().item())
+        self._metrics[mode]['batch/prompt_groups_partial_invalid'].append(partial_invalid.float().mean().item())
+        self._metrics[mode]['batch/prompt_groups_valid'].append((~nan_mask.any(dim=1)).float().mean().item())
 
         # Zero out NaN advantages so they don't produce NaN gradients
         advantages = advantages.nan_to_num(0.0)
