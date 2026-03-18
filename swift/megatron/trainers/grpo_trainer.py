@@ -5,6 +5,7 @@ import base64
 import concurrent.futures
 import inspect
 import os
+import time
 import uuid
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
@@ -54,13 +55,27 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         self._init_grpo_params()
         self._init_rollout_engine()
         self._prepare_rewards()
+        self._validate_async_replay_mode()
+        self._init_async_replay_state()
         self._prepare_scheduler()
         self._train_dataset = None
 
     def train(self, train_dataset, val_dataset):
         if self.dynamic_sample or self.truncation_strategy == 'delete':
             self._train_dataset = train_dataset
-        super().train(train_dataset, val_dataset)
+        try:
+            super().train(train_dataset, val_dataset)
+        finally:
+            self._drain_async_replay_producer()
+            self._shutdown_async_replay_executor()
+
+    def evaluate(self, val_data_iterator):
+        self._drain_async_replay_producer()
+        return super().evaluate(val_data_iterator)
+
+    def save_checkpoint(self):
+        self._drain_async_replay_producer()
+        return super().save_checkpoint()
 
     def _init_grpo_params(self):
         """Initialize GRPO-specific parameters.
@@ -117,6 +132,11 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         # truncation_strategy support
         self.truncation_strategy = args.truncation_strategy
+        self.enable_async_replay_buffer = args.enable_async_replay_buffer
+        self.async_replay_buffer_size = args.async_replay_buffer_size
+        self.async_replay_max_policy_lag_steps = args.async_replay_max_policy_lag_steps
+        self.async_replay_ready_timeout_s = args.async_replay_ready_timeout_s
+        self.async_replay_fail_open_to_sync = args.async_replay_fail_open_to_sync
 
     def _init_rollout_engine(self):
         """Initialize rollout engine with GRPO-specific extensions."""
@@ -214,6 +234,46 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 assert isinstance(args.multi_turn_scheduler, MultiTurnScheduler)
                 self.multi_turn_scheduler: MultiTurnScheduler = args.multi_turn_scheduler
 
+    def _validate_async_replay_mode(self):
+        if not self.enable_async_replay_buffer:
+            return
+        if self.steps_per_generation != 1:
+            raise ValueError('enable_async_replay_buffer requires steps_per_generation == 1')
+        if self.loss_type not in ['grpo', 'bnpo', 'dr_grpo', 'dapo', 'cispo', 'sapo']:
+            raise ValueError(f'Unsupported loss_type for async replay buffer: {self.loss_type}')
+        if self.args.vllm_mode != 'server':
+            raise ValueError('enable_async_replay_buffer requires vllm_mode=server')
+        if self.dynamic_sample:
+            raise ValueError('enable_async_replay_buffer does not support dynamic_sample')
+        if getattr(self.args, 'lora_dropout', 0.0) != 0.0:
+            raise ValueError('enable_async_replay_buffer requires lora_dropout=0.0')
+        if self.rollout_importance_sampling_mode != 'sequence_mask':
+            raise ValueError('enable_async_replay_buffer requires rollout_importance_sampling_mode=sequence_mask')
+        if self.importance_sampling_level != 'sequence':
+            raise ValueError('enable_async_replay_buffer requires importance_sampling_level=sequence')
+        if any(isinstance(func, nn.Module) for func in self.reward_funcs):
+            raise ValueError('enable_async_replay_buffer does not support nn.Module reward functions')
+
+    def _init_async_replay_state(self):
+        self._async_replay_executor = None
+        self._async_replay_future = None
+        self._async_replay_ready_item = None
+        self._async_replay_loaded_behavior_version = None
+        self._async_replay_last_consumed_version = None
+        self._async_replay_last_source = None
+        if not self.enable_async_replay_buffer:
+            return
+        if self.is_main_process:
+            self._async_replay_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix='MegatronGRPOReplay')
+            atexit.register(self._shutdown_async_replay_executor)
+
+    def _shutdown_async_replay_executor(self):
+        executor = getattr(self, '_async_replay_executor', None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+            self._async_replay_executor = None
+
     def _init_resample_data_iterator(self):
         """Initialize an independent data iterator for dynamic resampling (lazy initialization).
 
@@ -247,6 +307,9 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         return resample_data_iterator
 
     def _replace_data_iterator(self, data_iterator):
+        if self.enable_async_replay_buffer and self.unwrapped_models[0].training:
+            return self._replace_data_iterator_async(data_iterator)
+
         if self._step % self.steps_per_generation == 0:
             num_iters_per_step = self.get_num_iters_per_step()
             rollout_batch = []
@@ -263,6 +326,284 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         inputs = self._buffered_inputs[self._step % self.steps_per_generation]
         self._step += 1
         return RerunDataIterator(iter(inputs))
+
+    def _replace_data_iterator_async(self, data_iterator):
+        replay_item = self._pop_ready_replay_item()
+        replay_source = 'async_prefetch'
+        if replay_item is None:
+            replay_source = 'sync_cold_start' if self._step == 0 else 'sync_fallback'
+            replay_item = self._build_replay_item_sync(data_iterator)
+
+        if replay_item is None:
+            raise RuntimeError('Async replay buffer failed to produce a replay item.')
+
+        age_steps = max(self._step - replay_item['behavior_version'], 0)
+        if age_steps > self.async_replay_max_policy_lag_steps:
+            self._record_async_metric('discarded_stale_replay_items', 1.0)
+            replay_source = 'sync_fallback'
+            replay_item = self._build_replay_item_sync(data_iterator)
+            age_steps = max(self._step - replay_item['behavior_version'], 0)
+
+        micro_batch_data = self._prepare_training_batches_from_replay_item(replay_item)
+        self._buffered_inputs = [micro_batch_data]
+        self._async_replay_last_consumed_version = replay_item['behavior_version']
+        self._async_replay_last_source = replay_source
+        self._log_async_replay_consumption(replay_item, replay_source, age_steps)
+
+        if self._async_replay_ready_item is None and self._async_replay_future is None:
+            self._schedule_async_replay_prefetch(data_iterator)
+
+        inputs = self._buffered_inputs[0]
+        self._buffered_inputs = None
+        self._step += 1
+        return RerunDataIterator(iter(inputs))
+
+    def _next_rollout_prompt_batch(self, data_iterator):
+        num_iters_per_step = self.get_num_iters_per_step()
+        rollout_batch = []
+        for _ in range(num_iters_per_step):
+            rollout_batch.extend(next(data_iterator))
+        return rollout_batch
+
+    def _prepare_local_rollout_batch_for_async(self, prompt_batch):
+        if self.truncation_strategy == 'delete':
+            prompt_batch = self.resample_encode_failed_inputs(prompt_batch)
+        return self.get_local_rollout_batch(prompt_batch)
+
+    def _ensure_async_behavior_loaded(self, behavior_version: int):
+        if self._async_replay_loaded_behavior_version == behavior_version and self.args.sleep_level != 2:
+            return
+        self._move_model_to_vllm()
+        self._async_replay_loaded_behavior_version = behavior_version
+        self._last_loaded_step = behavior_version
+
+    def _add_prompt_id_to_inputs_local(self, inputs: DataType) -> DataType:
+        if not inputs:
+            return inputs
+        messages_to_prompt_id = {}
+        prompt_id_counter = 0
+        for input_item in inputs:
+            messages = input_item.get('messages')
+            key = json.dumps(messages)
+            if key not in messages_to_prompt_id:
+                messages_to_prompt_id[key] = f'prompt_{prompt_id_counter}'
+                prompt_id_counter += 1
+        for input_item in inputs:
+            messages = input_item.get('messages')
+            input_item['prompt_id'] = messages_to_prompt_id[json.dumps(messages)]
+            input_item['request_id'] = f'chatcmpl-{str(uuid.uuid4().hex)}'
+        return inputs
+
+    def _preprocess_inputs_local(self, inputs: DataType) -> DataType:
+        processed_inputs = self._add_prompt_id_to_inputs_local(inputs)
+        processed_inputs = self._set_inputs_system(processed_inputs)
+        for input_item in processed_inputs:
+            remove_response(input_item['messages'])
+        return processed_inputs
+
+    def _collect_replay_item_global(self, global_rollout_batch: DataType, behavior_version: int,
+                                    created_step: int) -> Dict[str, Any]:
+        batch = self._preprocess_inputs_local(deepcopy(global_rollout_batch))
+        request_config = self._get_request_config()
+        outputs = self._server_rollout(batch, request_config, is_global_inputs=True)
+        if not self.is_main_process:
+            raise RuntimeError('_collect_replay_item_global should only run on the main process')
+        batch = self.postprocess_rollout_data(batch, outputs)
+        rewards_per_func = self._score_completions(batch)
+        rewards_per_func = self._mask_invalid_rollouts(batch, rewards_per_func)
+
+        log_payload = None
+        if self.log_completions:
+            prompt_messages = [deepcopy(data['messages']) for data in batch]
+            completions = [
+                (data.get('rollout_infos') or {}).get('completion_summary')
+                or output.response.choices[0].message.content for data, output in zip(batch, outputs)
+            ]
+            rollout_infos_list = [(data.get('rollout_infos') or {}) for data in batch]
+            log_payload = {
+                'prompt': self._apply_chat_template_to_messages_list(prompt_messages),
+                'completion': completions,
+                'rollout_infos': rollout_infos_list,
+            }
+
+        return {
+            'replay_id': str(uuid.uuid4().hex),
+            'behavior_version': behavior_version,
+            'behavior_step': behavior_version,
+            'created_step': created_step,
+            'created_time': time.time(),
+            'rollout_batch_full': batch,
+            'rewards_per_func_full': rewards_per_func.detach().cpu(),
+            'num_generations': self.num_generations,
+            'generation_batch_size': self.generation_batch_size,
+            'log_payload': log_payload,
+        }
+
+    def _broadcast_replay_item(self, replay_item: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        payload = [replay_item if self.is_main_process else None]
+        payload = broadcast_object_list(payload, from_process=self.world_size - 1)
+        return payload[0]
+
+    def _build_replay_item_sync(self, data_iterator) -> Dict[str, Any]:
+        prompt_batch = self._next_rollout_prompt_batch(data_iterator)
+        local_rollout_batch = self._prepare_local_rollout_batch_for_async(prompt_batch)
+        global_rollout_batch = gather_object(local_rollout_batch)
+        behavior_version = self._step
+        self._ensure_async_behavior_loaded(behavior_version)
+        if self.is_main_process:
+            try:
+                replay_item = self._collect_replay_item_global(global_rollout_batch, behavior_version, self._step)
+            except Exception as exc:
+                replay_item = {'__async_replay_error__': repr(exc)}
+        else:
+            replay_item = None
+        replay_item = self._broadcast_replay_item(replay_item)
+        if replay_item is not None and '__async_replay_error__' in replay_item:
+            raise RuntimeError(f"Synchronous replay generation failed: {replay_item['__async_replay_error__']}")
+        if replay_item is None:
+            raise RuntimeError('Failed to broadcast synchronous replay item')
+        return replay_item
+
+    def _schedule_async_replay_prefetch(self, data_iterator):
+        if not self.enable_async_replay_buffer or self._async_replay_future is not None:
+            return
+        prompt_batch = self._next_rollout_prompt_batch(data_iterator)
+        local_rollout_batch = self._prepare_local_rollout_batch_for_async(prompt_batch)
+        global_rollout_batch = gather_object(local_rollout_batch)
+        behavior_version = self._step
+        self._ensure_async_behavior_loaded(behavior_version)
+        if self.is_main_process:
+            self._async_replay_future = self._async_replay_executor.submit(
+                self._collect_replay_item_global, global_rollout_batch, behavior_version, self._step)
+        self._record_async_metric('producer_active', 1.0)
+        self._record_async_metric('buffer_depth', 1.0)
+
+    def _pop_ready_replay_item(self) -> Optional[Dict[str, Any]]:
+        if self._async_replay_ready_item is None and self.is_main_process and self._async_replay_future is not None:
+            future = self._async_replay_future
+            wait_started = time.monotonic()
+            try:
+                replay_item = future.result(timeout=self.async_replay_ready_timeout_s)
+            except concurrent.futures.TimeoutError:
+                if self.async_replay_fail_open_to_sync and future.cancel():
+                    logger.warning('Async replay prefetch timed out before start; falling back to sync generation.')
+                    self._record_async_metric('fallback_sync_count', 1.0)
+                    replay_item = None
+                else:
+                    logger.warning('Async replay prefetch timed out while running; waiting for completion.')
+                    replay_item = future.result()
+            except Exception as exc:
+                self._record_async_metric('producer_errors', 1.0)
+                if self.async_replay_fail_open_to_sync:
+                    logger.exception('Async replay prefetch failed; falling back to sync generation.')
+                    replay_item = None
+                else:
+                    logger.exception('Async replay prefetch failed; propagating to all ranks.')
+                    replay_item = {'__async_replay_error__': repr(exc)}
+            self._async_replay_future = None
+            self._async_replay_ready_item = replay_item
+            self._record_async_metric('consumer_wait_s', time.monotonic() - wait_started)
+
+        replay_item = self._async_replay_ready_item if self.is_main_process else None
+        replay_item = self._broadcast_replay_item(replay_item)
+        self._async_replay_ready_item = None
+        if replay_item is not None and '__async_replay_error__' in replay_item:
+            raise RuntimeError(replay_item['__async_replay_error__'])
+        if replay_item is not None:
+            self._record_async_metric('producer_active', 0.0)
+        return replay_item
+
+    def _slice_replay_item_for_rank(self, replay_item: Dict[str, Any]) -> Tuple[DataType, torch.Tensor]:
+        start_idx = self.process_index * self.per_device_generation_batch_size
+        end_idx = start_idx + self.per_device_generation_batch_size
+        local_rollout_batch = replay_item['rollout_batch_full'][start_idx:end_idx]
+        rewards_full = replay_item['rewards_per_func_full']
+        if isinstance(rewards_full, list):
+            rewards_full = torch.tensor(rewards_full, dtype=torch.float32)
+        local_rewards = rewards_full[start_idx:end_idx].to(self.device)
+        return local_rollout_batch, local_rewards
+
+    def _prepare_training_batches_from_replay_item(self, replay_item: Dict[str, Any]) -> List[Dict[str, Any]]:
+        rollout_group = self._get_rollout_group()
+        rollout_batch, rewards_per_func = self._slice_replay_item_for_rank(replay_item)
+
+        total_batch = gather_object(rollout_batch, group=rollout_group)
+        total_batch = self._maybe_replace_response_token(total_batch)
+        mini_batch_data = []
+        template = self.template
+
+        with self._template_context(template):
+            encoded_list, error_list = self._batch_encode(total_batch, template, strict=True, return_length=True)
+
+            for idx in range(0, len(encoded_list), self.micro_batch_size):
+                encoded_batch_data = encoded_list[idx:idx + self.micro_batch_size]
+                micro_batch_data = total_batch[idx:idx + self.micro_batch_size]
+                encoded_batch_data = self._get_encoded_batch(encoded_batch_data, micro_batch_data, template)
+                with profiling_context(self, 'compute_ref_old_logps'):
+                    encoded_batch_data = self._maybe_compute_logps(encoded_batch_data)
+                mini_batch_data.append(encoded_batch_data)
+
+        kl_values = None
+        if self.kl_in_reward and self.beta != 0.0:
+            kl_values = self._compute_kl_from_batches(mini_batch_data)
+
+        advantages = self._compute_advantages(rollout_batch, rewards_per_func, kl_values=kl_values)
+        total_advantages = gather(advantages, group=rollout_group)
+
+        for idx, micro_batch_encoded in enumerate(mini_batch_data):
+            start_idx = idx * self.micro_batch_size
+            end_idx = start_idx + micro_batch_encoded['num_samples']
+            micro_batch_advantages = total_advantages[start_idx:end_idx]
+            micro_batch_encoded['advantages'] = micro_batch_advantages
+
+        if self.loss_type in ['cispo', 'dapo']:
+            total_token_count = sum(batch_data['completion_mask'].sum().item() for batch_data in mini_batch_data)
+            total_token_count_tensor = torch.tensor(total_token_count, dtype=torch.int, device=self.device)
+            torch.distributed.all_reduce(total_token_count_tensor)
+            rollout_group_size = (
+                mpu.get_tensor_model_parallel_world_size() * mpu.get_pipeline_model_parallel_world_size()
+                * mpu.get_context_parallel_world_size())
+            num_items_in_batch = total_token_count_tensor / rollout_group_size
+            for batch_data in mini_batch_data:
+                batch_data['num_items_in_batch'] = num_items_in_batch
+
+        if self.log_completions and replay_item.get('log_payload') and self.is_main_process:
+            self._logs['prompt'].extend(replay_item['log_payload']['prompt'])
+            self._logs['completion'].extend(replay_item['log_payload']['completion'])
+            self._logs['rollout_infos'].extend(replay_item['log_payload']['rollout_infos'])
+
+        return mini_batch_data
+
+    def _record_async_metric(self, name: str, value: float):
+        mode = 'train' if self.unwrapped_models[0].training else 'eval'
+        self._metrics[mode][f'async/{name}'].append(value)
+
+    def _log_async_replay_consumption(self, replay_item: Dict[str, Any], source: str, age_steps: int):
+        self._record_async_metric('buffer_depth', 0.0)
+        self._record_async_metric('replay_item_behavior_version', float(replay_item['behavior_version']))
+        self._record_async_metric('current_behavior_version', float(self._step))
+        self._record_async_metric('behavior_lag_steps', float(age_steps))
+        if source == 'sync_fallback':
+            self._record_async_metric('fallback_sync_count', 1.0)
+        if self.is_main_process:
+            logger.info(
+                'ASYNC REPLAY: '
+                f"source={source} replay_id={replay_item['replay_id']} "
+                f"behavior_version={replay_item['behavior_version']} current_step={self._step} "
+                f"age_steps={age_steps} samples={len(replay_item['rollout_batch_full'])}")
+
+    def _drain_async_replay_producer(self):
+        if not self.enable_async_replay_buffer or not self.is_main_process:
+            return
+        future = self._async_replay_future
+        if future is None:
+            return
+        try:
+            replay_item = future.result()
+            if self._async_replay_ready_item is None:
+                self._async_replay_ready_item = replay_item
+        finally:
+            self._async_replay_future = None
 
     def _batch_encode(self, infer_requests: List[Dict], template: Template, strict: bool, **kwargs):
         # borrowed from swift/infer_engine/infer_engine.py
@@ -1251,6 +1592,7 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         # Rollout importance sampling correction
         rollout_correction_metrics = {}
+        rollout_is_weights = None
         should_compute_rollout_metrics = (
             self.rollout_importance_sampling_mode is not None or self.log_rollout_offpolicy_metrics)
         local_has_rollout_per_token_logps = rollout_per_token_logps is not None
@@ -1332,7 +1674,7 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         else:
             raise ValueError(f'Unknown loss type: {self.loss_type}')
 
-        if self.rollout_importance_sampling_mode is not None:
+        if rollout_is_weights is not None:
             # Apply IS weights to loss
             per_token_loss = per_token_loss * rollout_is_weights
         # Add KL penalty if needed

@@ -157,6 +157,11 @@ class RLHFMegatronArgumentsMixin:
     ref_model_mixup_alpha: float = 0.6
 
     async_generate: bool = False
+    enable_async_replay_buffer: bool = False
+    async_replay_buffer_size: int = 1
+    async_replay_max_policy_lag_steps: int = 1
+    async_replay_ready_timeout_s: float = 30.0
+    async_replay_fail_open_to_sync: bool = True
 
     move_model_batches: Optional[int] = None
 
@@ -209,6 +214,23 @@ class RLHFMegatronArgumentsMixin:
                 raise ValueError('multi_turn_scheduler is not supported for Megatron GRPO right now')
             if self.num_iterations > 1:
                 raise ValueError('num_iterations > 1 is not supported for Megatron GRPO right now')
+            if self.enable_async_replay_buffer:
+                if self.steps_per_generation not in (None, 1):
+                    raise ValueError('enable_async_replay_buffer requires steps_per_generation == 1')
+                if self.vllm_mode != 'server':
+                    raise ValueError('enable_async_replay_buffer only supports vllm_mode=server')
+                if self.async_replay_buffer_size != 1:
+                    raise ValueError('enable_async_replay_buffer currently only supports async_replay_buffer_size=1')
+                if self.async_replay_max_policy_lag_steps != 1:
+                    raise ValueError(
+                        'enable_async_replay_buffer currently only supports async_replay_max_policy_lag_steps=1')
+                if self.rollout_importance_sampling_mode != 'sequence_mask':
+                    raise ValueError(
+                        'enable_async_replay_buffer requires rollout_importance_sampling_mode=sequence_mask')
+                if self.importance_sampling_level != 'sequence':
+                    raise ValueError('enable_async_replay_buffer requires importance_sampling_level=sequence')
+                if self.dynamic_sample:
+                    raise ValueError('enable_async_replay_buffer does not support dynamic_sample')
 
         def _check_batch_params():
             # Set default values if both are None
