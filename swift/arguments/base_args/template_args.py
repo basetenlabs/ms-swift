@@ -133,6 +133,10 @@ class TemplateArguments:
     response_prefix: Optional[str] = None
     enable_thinking: Optional[bool] = None
     add_non_thinking_prefix: bool = True
+    # Kimi native SFT: which assistant messages to train on
+    # "suffix" = all suffix assistants (requires prefix_length in dataset)
+    # "last" = only the final assistant message
+    train_mode: Optional[str] = None
 
     def __post_init__(self):
         if getattr(self, 'model_meta', None) is not None:
@@ -181,4 +185,5 @@ class TemplateArguments:
             'response_prefix': self.response_prefix,
             'enable_thinking': self.enable_thinking,
             'add_non_thinking_prefix': self.add_non_thinking_prefix,
+            'train_mode': self.train_mode,
         }

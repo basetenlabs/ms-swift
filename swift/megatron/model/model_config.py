@@ -420,7 +420,7 @@ def convert_hf_config(config) -> Dict[str, Any]:
             'kimi_k2',
             'deepseek_v32',
             'dots1',
-    } or hf_model_type == 'kimi_vl':
+    } or hf_model_type in {'kimi_vl', 'kimi_k25'}:
         if llm_model_type != 'deepseek':
             res['qk_layernorm'] = True
         res['moe_router_load_balancing_type'] = 'seq_aux_loss'

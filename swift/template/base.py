@@ -94,6 +94,7 @@ class Template(ProcessorMixin):
         response_prefix: Optional[str] = None,
         enable_thinking: Optional[bool] = None,
         add_non_thinking_prefix: bool = True,
+        train_mode: Optional[str] = None,
     ) -> None:
         """
         default_system: Override the default_system in the template.
@@ -135,6 +136,7 @@ class Template(ProcessorMixin):
         self.add_non_thinking_prefix = add_non_thinking_prefix
         self.remove_unused_columns = remove_unused_columns
         self.template_backend = template_backend
+        self.train_mode = train_mode
         self.max_length = max_length
         self.truncation_strategy = truncation_strategy
         self.loss_scale: LossScale = get_loss_scale(loss_scale)

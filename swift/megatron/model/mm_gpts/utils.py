@@ -63,7 +63,11 @@ class HuggingFaceModule(_HuggingFaceModule, ABC):
             setattr(self, mg_prefix, deep_getattr(model, hf_prefix))
         self._hf_model = [model]
         self.prepare_model(model)
-        self.to('cuda')
+        # Models built under the meta device must be materialized with to_empty().
+        if any(param.is_meta for param in self.parameters()):
+            self.to_empty(device='cuda')
+        else:
+            self.to('cuda')
 
     def prepare_model(self, hf_model):
         pass
