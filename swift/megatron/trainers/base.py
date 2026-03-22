@@ -607,10 +607,12 @@ class BaseMegatronTrainer(ABC):
             if state.iteration == start_iteration and os.environ.get('WHETSTONE_MEM_PROFILE', '0') == '1':
                 import torch as _torch
                 if _torch.distributed.get_rank() == 0:
+                    _torch.cuda.reset_peak_memory_stats()
                     logger.info(f'[mem-profile] PRE first train_step: '
                                 f'allocated={_torch.cuda.memory_allocated() / 1e9:.2f}GB '
-                                f'reserved={_torch.cuda.memory_reserved() / 1e9:.2f}GB '
-                                f'max_allocated={_torch.cuda.max_memory_allocated() / 1e9:.2f}GB')
+                                f'reserved={_torch.cuda.memory_reserved() / 1e9:.2f}GB')
+                    # Enable memory history for snapshot
+                    _torch.cuda.memory._record_memory_history(max_entries=100000)
             metrics, grad_norm, update_successful = self.train_step(train_data_iterator)
             if state.iteration == start_iteration:
                 if os.environ.get('WHETSTONE_MEM_PROFILE', '0') == '1':
@@ -619,8 +621,16 @@ class BaseMegatronTrainer(ABC):
                         logger.info(f'[mem-profile] POST first train_step: '
                                     f'allocated={_torch.cuda.memory_allocated() / 1e9:.2f}GB '
                                     f'reserved={_torch.cuda.memory_reserved() / 1e9:.2f}GB '
-                                    f'max_allocated={_torch.cuda.max_memory_allocated() / 1e9:.2f}GB')
+                                    f'peak_allocated={_torch.cuda.max_memory_allocated() / 1e9:.2f}GB')
                         logger.info(f'[mem-profile]\n{_torch.cuda.memory_summary()}')
+                        # Save memory snapshot for visualization
+                        try:
+                            snapshot_path = os.path.join(os.environ.get('BT_CHECKPOINT_DIR', '/tmp'), 'mem_snapshot.pickle')
+                            _torch.cuda.memory._dump_snapshot(snapshot_path)
+                            logger.info(f'[mem-profile] Snapshot saved to {snapshot_path}')
+                            _torch.cuda.memory._record_memory_history(enabled=None)
+                        except Exception as e:
+                            logger.info(f'[mem-profile] Snapshot save failed: {e}')
                 if update_successful:
                     # Enable forward pre-hook after training step has successfully run. All subsequent
                     # forward passes will use the forward pre-hook / `param_sync_func` in
@@ -837,15 +847,34 @@ class BaseMegatronTrainer(ABC):
         self.optimizer.zero_grad()
         # TODO: refactor _replace_data_iterator
         data_iterator = self._replace_data_iterator(train_data_iterator)
-        metrics = forward_backward_func(
-            forward_step_func=self.forward_step,
-            data_iterator=data_iterator,
-            model=self.wrapped_models,
-            num_microbatches=args.num_microbatches,
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            forward_only=False,
-        )
+        try:
+            metrics = forward_backward_func(
+                forward_step_func=self.forward_step,
+                data_iterator=data_iterator,
+                model=self.wrapped_models,
+                num_microbatches=args.num_microbatches,
+                seq_length=args.seq_length,
+                micro_batch_size=args.micro_batch_size,
+                forward_only=False,
+            )
+        except RuntimeError as e:
+            if os.environ.get('WHETSTONE_MEM_PROFILE', '0') == '1':
+                import torch as _torch
+                rank = _torch.distributed.get_rank()
+                logger.info(f'[mem-profile] OOM on rank {rank}: '
+                            f'allocated={_torch.cuda.memory_allocated() / 1e9:.2f}GB '
+                            f'reserved={_torch.cuda.memory_reserved() / 1e9:.2f}GB '
+                            f'peak_allocated={_torch.cuda.max_memory_allocated() / 1e9:.2f}GB')
+                logger.info(f'[mem-profile] rank {rank} memory_summary:\n{_torch.cuda.memory_summary()}')
+                try:
+                    snapshot_path = os.path.join(
+                        os.environ.get('BT_CHECKPOINT_DIR', '/tmp'),
+                        f'mem_snapshot_rank{rank}.pickle')
+                    _torch.cuda.memory._dump_snapshot(snapshot_path)
+                    logger.info(f'[mem-profile] Snapshot saved to {snapshot_path}')
+                except Exception:
+                    pass
+            raise
 
         update_successful, grad_norm, _ = self.optimizer.step()
         update_successful = logical_and_across_model_parallel_group(update_successful)
