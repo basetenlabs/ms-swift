@@ -45,7 +45,7 @@ class KimiK25Vit(HuggingFaceModule):
             pixel_values = image_inputs['pixel_values'].to(device=inputs_embeds.device, dtype=model.vision_tower.dtype)
             grid_thws_dummy = image_inputs.get('grid_thws', image_inputs['image_grid_hws']).to(inputs_embeds.device)
             image_features: torch.Tensor = model._extract_image_features(pixel_values, grid_thws_dummy)
-            inputs_embeds = inputs_embeds + image_features.mean() * 0.
+            inputs_embeds = inputs_embeds + torch.cat(image_features).mean() * 0.
         return inputs_embeds
 
 
