@@ -604,8 +604,23 @@ class BaseMegatronTrainer(ABC):
         while state.iteration < args.train_iters:
             self.call_event('on_step_begin')
             maybe_finalize_async_save(args, blocking=False)
+            if state.iteration == start_iteration and os.environ.get('WHETSTONE_MEM_PROFILE', '0') == '1':
+                import torch as _torch
+                if _torch.distributed.get_rank() == 0:
+                    logger.info(f'[mem-profile] PRE first train_step: '
+                                f'allocated={_torch.cuda.memory_allocated() / 1e9:.2f}GB '
+                                f'reserved={_torch.cuda.memory_reserved() / 1e9:.2f}GB '
+                                f'max_allocated={_torch.cuda.max_memory_allocated() / 1e9:.2f}GB')
             metrics, grad_norm, update_successful = self.train_step(train_data_iterator)
             if state.iteration == start_iteration:
+                if os.environ.get('WHETSTONE_MEM_PROFILE', '0') == '1':
+                    import torch as _torch
+                    if _torch.distributed.get_rank() == 0:
+                        logger.info(f'[mem-profile] POST first train_step: '
+                                    f'allocated={_torch.cuda.memory_allocated() / 1e9:.2f}GB '
+                                    f'reserved={_torch.cuda.memory_reserved() / 1e9:.2f}GB '
+                                    f'max_allocated={_torch.cuda.max_memory_allocated() / 1e9:.2f}GB')
+                        logger.info(f'[mem-profile]\n{_torch.cuda.memory_summary()}')
                 if update_successful:
                     # Enable forward pre-hook after training step has successfully run. All subsequent
                     # forward passes will use the forward pre-hook / `param_sync_func` in
