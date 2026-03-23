@@ -211,8 +211,14 @@ class GPTBridge:
             tensor = tensor + offset
         tensor_list = tensor.chunk(len(mg_param), dim=0)
         for i, param in enumerate(mg_param):
-            tensor = tensor_list[i].reshape(*param.shape)
-            if self._is_fp8_param(param):
+            if self._is_fp4_param(param) and hf_scale_inv is not None:
+                # FP4 packed: 2 values per uint8 byte, so packed shape differs
+                # from logical param shape.  Copy raw bytes + scale directly.
+                tensor = tensor_list[i].view(torch.uint8)
+                param._rowwise_data.data.copy_(tensor.reshape(param._rowwise_data.shape))
+                self._copy_scale_inv(param, hf_scale_inv[i])
+            elif self._is_fp8_param(param):
+                tensor = tensor_list[i].reshape(*param.shape)
                 if hf_scale_inv is None:
                     param.data.copy_(tensor)
                     param._high_precision_init_val.copy_(tensor)
@@ -222,6 +228,7 @@ class GPTBridge:
                     self._copy_scale_inv(param, hf_scale_inv[i])
                     del param.get_high_precision_init_val
             else:
+                tensor = tensor_list[i].reshape(*param.shape)
                 if hf_scale_inv is not None:
                     fp8_tensor = self.fp8_quantizer.make_empty(tensor.shape)
                     fp8_tensor._rowwise_data.copy_(tensor.view(torch.uint8))
@@ -253,6 +260,14 @@ class GPTBridge:
         try:
             from transformer_engine.pytorch import Float8BlockwiseQTensor
             return isinstance(param, Float8BlockwiseQTensor)
+        except ImportError:
+            return False
+
+    @staticmethod
+    def _is_fp4_param(param):
+        try:
+            from megatron.core.fp4_utils import is_nvfp4tensor
+            return is_nvfp4tensor(param)
         except ImportError:
             return False
 
@@ -383,7 +398,7 @@ class GPTBridge:
         if tensor is not None:
             if not isinstance(tensor, (list, tuple)):
                 tensor = [tensor]
-            if self._is_fp8_param(tensor[0]):
+            if self._is_fp8_param(tensor[0]) or self._is_fp4_param(tensor[0]):
                 mg_scale_inv = [t._rowwise_scale_inv for t in tensor]
                 tensor = [t._rowwise_data for t in tensor]
         del mg_weight
