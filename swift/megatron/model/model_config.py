@@ -532,6 +532,9 @@ def get_mcore_model_config(args, hf_config):
     kwargs['num_layers_in_first_pipeline_stage'] = args.decoder_first_pipeline_num_layers
     kwargs['num_layers_in_last_pipeline_stage'] = args.decoder_last_pipeline_num_layers
     kwargs['fp8_param'] = args.fp8_param_gather
+    if getattr(args, 'fp4', None) is not None:
+        kwargs['fp4'] = args.fp4
+        kwargs['fp4_param'] = args.fp4_param
     kwargs['batch_p2p_comm'] = not args.overlap_p2p_comm
     swiglu = kwargs.get('swiglu', True)
     add_bias_linear = kwargs.get('add_bias_linear', False)

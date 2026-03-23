@@ -482,6 +482,10 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     fp8_amax_compute_algo: Literal['most_recent', 'max'] = 'max'
     fp8_param_gather: bool = False
 
+    # fp4
+    fp4_format: Literal['nvfp4'] = None
+    fp4_param: bool = False
+
     # mixed precision
     fp16: Optional[bool] = None
     bf16: Optional[bool] = None
@@ -631,6 +635,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
             raise ValueError('pipeline_model_parallel_size must be greater than 1 if you want to set '
                              'decoder_first_pipeline_num_layers or decoder_last_pipeline_num_layers.')
         self.fp8 = self.fp8_format  # compat megatron-lm
+        self.fp4 = self.fp4_format  # compat megatron-lm
         if self.task_type not in {'causal_lm', 'generative_reranker'}:
             self.untie_embeddings_and_output_weights = True
         if self.gradient_checkpointing_kwargs is not None:
