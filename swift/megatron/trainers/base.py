@@ -622,16 +622,15 @@ class BaseMegatronTrainer(ABC):
                                 f'allocated={_torch.cuda.memory_allocated() / 1e9:.2f}GB '
                                 f'reserved={_torch.cuda.memory_reserved() / 1e9:.2f}GB '
                                 f'peak_allocated={_torch.cuda.max_memory_allocated() / 1e9:.2f}GB')
-                    # Save snapshot on rank 0 even on success
-                    if rank == 0:
-                        try:
-                            snapshot_dir = os.environ.get('BT_CHECKPOINT_DIR', '/tmp')
-                            snapshot_path = os.path.join(snapshot_dir, f'mem_snapshot_rank{rank}.pickle')
-                            _torch.cuda.memory._dump_snapshot(snapshot_path)
-                            _torch.cuda.memory._record_memory_history(enabled=None)
-                            logger.info(f'[mem-profile] Snapshot saved to {snapshot_path}')
-                        except Exception as e:
-                            logger.info(f'[mem-profile] Snapshot save failed: {e}')
+                    # Save snapshot from all ranks
+                    try:
+                        snapshot_dir = os.environ.get('BT_CHECKPOINT_DIR', '/tmp')
+                        snapshot_path = os.path.join(snapshot_dir, f'mem_snapshot_rank{rank}.pickle')
+                        _torch.cuda.memory._dump_snapshot(snapshot_path)
+                        _torch.cuda.memory._record_memory_history(enabled=None)
+                        logger.info(f'[mem-profile] Snapshot saved to {snapshot_path}')
+                    except Exception as e:
+                        logger.info(f'[mem-profile] Snapshot save failed: {e}')
                 if update_successful:
                     # Enable forward pre-hook after training step has successfully run. All subsequent
                     # forward passes will use the forward pre-hook / `param_sync_func` in
