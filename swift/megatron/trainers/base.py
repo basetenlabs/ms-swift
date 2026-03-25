@@ -604,22 +604,15 @@ class BaseMegatronTrainer(ABC):
         while state.iteration < args.train_iters:
             self.call_event('on_step_begin')
             maybe_finalize_async_save(args, blocking=False)
-            if state.iteration == start_iteration:
+            if state.iteration == start_iteration and os.environ.get('WHETSTONE_MEM_PROFILE', '0') == '1':
                 import torch as _torch
-                mem_fraction = os.environ.get('PYTORCH_CUDA_ALLOC_MAX_FRACTION', '')
-                if mem_fraction:
-                    frac = float(mem_fraction)
-                    for dev_idx in range(_torch.cuda.device_count()):
-                        _torch.cuda.set_per_process_memory_fraction(frac, dev_idx)
-                    logger.info(f'[mem] Set per_process_memory_fraction={frac}')
-                if os.environ.get('WHETSTONE_MEM_PROFILE', '0') == '1':
-                    rank = _torch.distributed.get_rank()
-                    _torch.cuda.reset_peak_memory_stats()
-                    _torch.cuda.memory._record_memory_history(max_entries=200000)
-                    logger.info(f'[mem-profile] rank {rank} PRE first train_step: '
-                                f'allocated={_torch.cuda.memory_allocated() / 1e9:.2f}GB '
-                                f'reserved={_torch.cuda.memory_reserved() / 1e9:.2f}GB '
-                                f'(recording memory history for snapshot)')
+                rank = _torch.distributed.get_rank()
+                _torch.cuda.reset_peak_memory_stats()
+                _torch.cuda.memory._record_memory_history(max_entries=200000)
+                logger.info(f'[mem-profile] rank {rank} PRE first train_step: '
+                            f'allocated={_torch.cuda.memory_allocated() / 1e9:.2f}GB '
+                            f'reserved={_torch.cuda.memory_reserved() / 1e9:.2f}GB '
+                            f'(recording memory history for snapshot)')
             metrics, grad_norm, update_successful = self.train_step(train_data_iterator)
             if state.iteration == start_iteration:
                 if os.environ.get('WHETSTONE_MEM_PROFILE', '0') == '1':
