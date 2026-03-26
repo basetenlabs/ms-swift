@@ -4,7 +4,9 @@ import logging
 import megatron.core
 import operator
 import os
+import signal
 import shutil
+import sys
 import time
 import torch
 import torch.nn
@@ -49,6 +51,126 @@ except ImportError:
     param_group_identifier_keys = None
 
 logger = get_logger()
+
+
+def _whetstone_mem_profile_enabled() -> bool:
+    return os.environ.get('WHETSTONE_MEM_PROFILE', '0') == '1'
+
+
+def _whetstone_get_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return int(os.environ.get('RANK', '0'))
+
+
+def _whetstone_snapshot_dir() -> str:
+    base_dir = os.environ.get('BT_RW_CACHE_DIR', os.environ.get('BT_CHECKPOINT_DIR', '/tmp'))
+    job_name = os.environ.get('BT_TRAINING_JOB_NAME') or os.environ.get('BT_TRAINING_JOB_ID')
+    if job_name:
+        return os.path.join(base_dir, job_name, 'mem_profiles')
+    return os.path.join(base_dir, 'mem_profiles')
+
+
+def _whetstone_snapshot_path(rank: Optional[int] = None) -> str:
+    rank = _whetstone_get_rank() if rank is None else rank
+    return os.path.join(_whetstone_snapshot_dir(), f'mem_snapshot_rank{rank}.pickle')
+
+
+def _whetstone_dump_request_path() -> str:
+    return os.path.join(_whetstone_snapshot_dir(), 'dump_request.txt')
+
+
+def _whetstone_dump_snapshot(reason: str, disable_history: bool = False, stream=None) -> None:
+    stream = stream or sys.stderr
+    rank = _whetstone_get_rank()
+    alloc = torch.cuda.memory_allocated() / 1e9
+    res = torch.cuda.memory_reserved() / 1e9
+    peak = torch.cuda.max_memory_allocated() / 1e9
+    print(
+        f'[mem-profile] rank {rank} {reason}: '
+        f'allocated={alloc:.2f}GB reserved={res:.2f}GB peak_allocated={peak:.2f}GB',
+        file=stream,
+        flush=True,
+    )
+    snapshot_path = _whetstone_snapshot_path(rank)
+    os.makedirs(os.path.dirname(snapshot_path), exist_ok=True)
+    torch.cuda.memory._dump_snapshot(snapshot_path)
+    if disable_history:
+        torch.cuda.memory._record_memory_history(enabled=None)
+    print(f'[mem-profile] Snapshot saved to {snapshot_path}', file=stream, flush=True)
+
+
+def _whetstone_request_global_dump(reason: str) -> None:
+    os.makedirs(_whetstone_snapshot_dir(), exist_ok=True)
+    with open(_whetstone_dump_request_path(), 'w') as f:
+        f.write(reason)
+
+
+def _whetstone_start_dump_watcher() -> None:
+    if not _whetstone_mem_profile_enabled():
+        return
+    if os.environ.get('WHETSTONE_MEM_PROFILE_DUMP_WATCHER_STARTED') == '1':
+        return
+
+    import threading
+
+    def _watch_for_dump_request():
+        request_path = _whetstone_dump_request_path()
+        handled = False
+        while True:
+            try:
+                if not handled and os.path.exists(request_path):
+                    with open(request_path) as f:
+                        reason = f.read().strip() or 'global dump request'
+                    _whetstone_dump_snapshot(
+                        f'GLOBAL_DUMP {reason}',
+                        disable_history=False,
+                        stream=sys.stderr,
+                    )
+                    handled = True
+            except Exception as exc:
+                print(f'[mem-profile] Dump watcher failed: {exc}', file=sys.stderr, flush=True)
+            time.sleep(1)
+
+    watcher = threading.Thread(target=_watch_for_dump_request, daemon=True)
+    watcher.start()
+    os.environ['WHETSTONE_MEM_PROFILE_DUMP_WATCHER_STARTED'] = '1'
+
+
+def _whetstone_install_signal_snapshot_handlers() -> None:
+    if not _whetstone_mem_profile_enabled():
+        return
+    if os.environ.get('WHETSTONE_MEM_PROFILE_SIGNAL_HANDLERS_INSTALLED') == '1':
+        return
+
+    handled_signals = (signal.SIGTERM, signal.SIGINT)
+    original_handlers = {}
+    handler_active = False
+
+    def _handle_abort(signum, frame):
+        nonlocal handler_active
+        if handler_active:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+        handler_active = True
+        try:
+            _whetstone_request_global_dump(
+                f'ABORT rank={_whetstone_get_rank()} signal={signal.Signals(signum).name}'
+            )
+            _whetstone_dump_snapshot(f'ABORT signal={signal.Signals(signum).name}', stream=sys.stderr)
+        except Exception as exc:
+            print(f'[mem-profile] Signal snapshot save failed: {exc}', file=sys.stderr, flush=True)
+        finally:
+            previous = original_handlers.get(signum, signal.SIG_DFL)
+            signal.signal(signum, previous if previous not in (None, signal.SIG_IGN) else signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+    for signum in handled_signals:
+        original_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, _handle_abort)
+
+    os.environ['WHETSTONE_MEM_PROFILE_SIGNAL_HANDLERS_INSTALLED'] = '1'
 
 
 class BaseMegatronTrainer(ABC):
@@ -604,9 +726,11 @@ class BaseMegatronTrainer(ABC):
         while state.iteration < args.train_iters:
             self.call_event('on_step_begin')
             maybe_finalize_async_save(args, blocking=False)
-            if state.iteration == start_iteration and os.environ.get('WHETSTONE_MEM_PROFILE', '0') == '1':
+            if state.iteration == start_iteration and _whetstone_mem_profile_enabled():
                 import torch as _torch
                 rank = _torch.distributed.get_rank()
+                _whetstone_install_signal_snapshot_handlers()
+                _whetstone_start_dump_watcher()
                 _torch.cuda.reset_peak_memory_stats()
                 _torch.cuda.memory._record_memory_history(max_entries=200000)
                 logger.info(f'[mem-profile] rank {rank} PRE first train_step: '
@@ -615,20 +739,17 @@ class BaseMegatronTrainer(ABC):
                             f'(recording memory history for snapshot)')
             metrics, grad_norm, update_successful = self.train_step(train_data_iterator)
             if state.iteration == start_iteration:
-                if os.environ.get('WHETSTONE_MEM_PROFILE', '0') == '1':
+                if _whetstone_mem_profile_enabled():
                     import torch as _torch
                     rank = _torch.distributed.get_rank()
                     logger.info(f'[mem-profile] rank {rank} POST first train_step: '
                                 f'allocated={_torch.cuda.memory_allocated() / 1e9:.2f}GB '
                                 f'reserved={_torch.cuda.memory_reserved() / 1e9:.2f}GB '
                                 f'peak_allocated={_torch.cuda.max_memory_allocated() / 1e9:.2f}GB')
-                    # Save snapshot from all ranks
+                    # Save snapshot from all ranks — use shared cache so all nodes' snapshots
+                    # are accessible from any node via kubectl cp
                     try:
-                        snapshot_dir = os.environ.get('BT_CHECKPOINT_DIR', '/tmp')
-                        snapshot_path = os.path.join(snapshot_dir, f'mem_snapshot_rank{rank}.pickle')
-                        _torch.cuda.memory._dump_snapshot(snapshot_path)
-                        _torch.cuda.memory._record_memory_history(enabled=None)
-                        logger.info(f'[mem-profile] Snapshot saved to {snapshot_path}')
+                        _whetstone_dump_snapshot('POST first train_step', disable_history=True, stream=sys.stderr)
                     except Exception as e:
                         logger.info(f'[mem-profile] Snapshot save failed: {e}')
                 if update_successful:
@@ -858,31 +979,18 @@ class BaseMegatronTrainer(ABC):
                 forward_only=False,
             )
         except RuntimeError as e:
-            if os.environ.get('WHETSTONE_MEM_PROFILE', '0') == '1':
-                import torch as _torch
-                import sys
+            if _whetstone_mem_profile_enabled():
                 try:
-                    rank = _torch.distributed.get_rank()
-                    alloc = _torch.cuda.memory_allocated() / 1e9
-                    res = _torch.cuda.memory_reserved() / 1e9
-                    peak = _torch.cuda.max_memory_allocated() / 1e9
-                    print(f'[mem-profile] OOM on rank {rank}: '
-                          f'allocated={alloc:.2f}GB reserved={res:.2f}GB '
-                          f'peak_allocated={peak:.2f}GB', file=sys.stderr, flush=True)
+                    _whetstone_request_global_dump(f'RuntimeError rank={_whetstone_get_rank()} type={type(e).__name__}')
+                    _whetstone_dump_snapshot(f'RuntimeError {type(e).__name__}', disable_history=True, stream=sys.stderr)
                 except Exception as e2:
-                    print(f'[mem-profile] Failed to get memory stats: {e2}',
+                    print(f'[mem-profile] Failed to save RuntimeError snapshot: {e2}',
                           file=sys.stderr, flush=True)
-                # Save memory snapshot for offline analysis
-                try:
-                    snapshot_dir = os.environ.get('BT_CHECKPOINT_DIR', '/tmp')
-                    snapshot_path = os.path.join(snapshot_dir, f'mem_snapshot_rank{rank}.pickle')
-                    _torch.cuda.memory._dump_snapshot(snapshot_path)
-                    _torch.cuda.memory._record_memory_history(enabled=None)
-                    print(f'[mem-profile] Snapshot saved to {snapshot_path}',
-                          file=sys.stderr, flush=True)
-                except Exception as e3:
-                    print(f'[mem-profile] Snapshot save failed: {e3}',
-                          file=sys.stderr, flush=True)
+                # Keep the process alive so snapshots can be downloaded
+                print(f'[mem-profile] Sleeping to allow snapshot download. '
+                      f'kubectl cp the snapshot, then kill the job.',
+                      file=sys.stderr, flush=True)
+                time.sleep(120)  # 2 minutes
             raise
 
         update_successful, grad_norm, _ = self.optimizer.step()
