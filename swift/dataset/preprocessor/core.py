@@ -30,6 +30,10 @@ class RowPreprocessor:
                                 'label',
                                 'channel',
                                 'margin',
+                                # Whetstone (Kimi K2.5 native SFT): dataset-level
+                                # boundary for train_mode='suffix'. Preserved so
+                                # kimi_k25_native.py can read it from extra_kwargs.
+                                'prefix_length',
                             ]
 
     def __init__(self,
@@ -63,8 +67,11 @@ class RowPreprocessor:
         messages = row['messages']
         assert len(messages) > 0, f'messages: {messages}'
         # fix swift/SlimOrca
+        # Whetstone: also preserve tool_calls, tool_call_id, reasoning_content so
+        # the Kimi-K2.5 native SFT template can see the agent trajectory structure.
+        _keep = {'role', 'content', 'loss', 'tool_calls', 'tool_call_id', 'reasoning_content'}
         for message in messages:
-            keys = set(message.keys()) - {'role', 'content', 'loss'}
+            keys = set(message.keys()) - _keep
             for key in keys:
                 message.pop(key)
 

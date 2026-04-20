@@ -28,11 +28,17 @@ from ..utils import Prompt
 from whetstone.kimi_sft_utils import (
     ASSISTANT_PREFIX_IDS,
     IM_END_ID,
+    KIMI_K25_FINAL_TURN_CHAT_TEMPLATE,
     build_labels,
     build_labels_for_ordinals,
+    compute_final_turn_marker,
     compute_trainable_ordinals,
     find_assistant_body_spans,
     verify_token_ids,
+)
+from whetstone.tool_ts_encoder import (
+    encode_tools_to_typescript_style,
+    encode_tools_ts_cached,
 )
 
 
@@ -51,6 +57,8 @@ class KimiK25NativeSFTTemplate(Template):
     """
 
     _token_ids_verified = False
+    _train_mode_logged = False
+    _label_debug_count = 0
 
     def _verify_token_ids(self):
         """One-time check that hardcoded token IDs match this tokenizer."""
@@ -85,16 +93,34 @@ class KimiK25NativeSFTTemplate(Template):
             sanitized.append(msg)
         return sanitized
 
-    def _render_and_tokenize(self, messages: list, tools: list | None) -> List[int]:
-        """Render messages with official Kimi chat template, then tokenize."""
+    def _render_and_tokenize(
+        self, messages: list, tools: list | None, *, use_final_turn_template: bool = True,
+    ) -> List[int]:
+        """Render messages with the Kimi chat template, then tokenize.
+
+        By default uses the modified ("final_turn") template that walks back
+        from len-2 to find the hist/suffix split, so a final non-tool-call
+        assistant answer ends up in the suffix with reasoning preserved.
+        Set use_final_turn_template=False to use the official template (e.g.
+        for parity tests).
+        """
         import json as _json
         messages = self._sanitize_messages(messages)
         kwargs = {}
+        _tools_was_str = False
         if tools:
-            # HF datasets may store tools as a JSON string; deserialize if needed
+            # HF datasets may store tools as a JSON string; deserialize if needed,
+            # keeping the original string for the TS-encoder cache (hash of string
+            # is trivially cheap vs. hashing a parsed dict).
             if isinstance(tools, str):
+                _tools_was_str = True
+                kwargs['tools_ts_str'] = encode_tools_ts_cached(tools)
                 tools = _json.loads(tools)
+            else:
+                kwargs['tools_ts_str'] = encode_tools_to_typescript_style(tools)
             kwargs['tools'] = tools
+        if use_final_turn_template:
+            kwargs['chat_template'] = KIMI_K25_FINAL_TURN_CHAT_TEMPLATE
         text = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -103,6 +129,20 @@ class KimiK25NativeSFTTemplate(Template):
             **kwargs,
         )
         input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+
+        # Debug: first few rows dump rendering details
+        if KimiK25NativeSFTTemplate._label_debug_count < 4:
+            import os as _os, sys as _sys
+            rank = _os.environ.get('RANK', '?')
+            ts_str = kwargs.get('tools_ts_str', '')
+            has_ts = 'namespace functions' in (ts_str or '')
+            print(
+                f'[kimi_k25_native_sft render rank={rank}] '
+                f'n_msgs={len(messages)} text_chars={len(text)} n_tokens={len(input_ids)} '
+                f'tools_was_str={_tools_was_str} tools_ts_str_len={len(ts_str or "")} '
+                f'has_ts={has_ts} used_final_turn={use_final_turn_template}',
+                file=_sys.stderr, flush=True,
+            )
         return input_ids
 
     def _build_labels(self, input_ids: List[int]) -> List[int]:
@@ -117,32 +157,47 @@ class KimiK25NativeSFTTemplate(Template):
         - tool messages are not merged or reformatted
         - system prompt is not replaced with agent template instructions
 
-        Uses train_mode (default "suffix") and prefix_length to decide which
-        assistant messages to train on:
-        - "suffix": requires prefix_length; trains assistant messages at
-          index >= prefix_length
-        - "last": trains only the final assistant message; prefix_length
-          is ignored if absent
+        train_mode controls which assistant messages get supervised:
+        - "final_turn" (default): assistant messages at idx > final_turn_marker,
+          where the marker is the last non-tool-call assistant excluding
+          the very last message. Matches the modified Kimi chat template's
+          hist/suffix split, so reasoning is preserved exactly on the
+          trained spans.
+        - "suffix": requires prefix_length on the row; trains assistant
+          messages at idx >= prefix_length.
+        - "last": trains only the final assistant message.
         """
         self._verify_token_ids()
 
-        # Determine train_mode.  Priority:
+        # Determine train_mode. Priority:
         #   1. Config-level self.train_mode (from YAML / get_template())
         #   2. Per-row field (train_mode in dataset row → extra_kwargs)
-        #   3. "suffix" if prefix_length is present, "last" otherwise
+        #   3. "final_turn" (default — matches the modified chat template)
         prefix_length = inputs.extra_kwargs.get('prefix_length')
         train_mode = (
             self.train_mode
             or inputs.extra_kwargs.get('train_mode')
+            or 'final_turn'
         )
-        if train_mode is None:
-            train_mode = 'suffix' if prefix_length is not None else 'last'
-        if prefix_length is None and train_mode == 'suffix':
+        if train_mode == 'suffix' and prefix_length is None:
             raise ValueError(
                 "kimi_k25_native_sft template requires 'prefix_length' on every example "
                 "when train_mode='suffix'. Set it in the dataset row as a top-level field, "
-                "or use train_mode='last'."
+                "or use train_mode='final_turn' (default) or train_mode='last'."
             )
+
+        # One-shot log line to confirm which train_mode is active on the pod.
+        if not KimiK25NativeSFTTemplate._train_mode_logged:
+            import os as _os, sys as _sys
+            rank = _os.environ.get('RANK', '?')
+            print(
+                f'[kimi_k25_native_sft rank={rank}] train_mode={train_mode!r} '
+                f'(self.train_mode={self.train_mode!r}, '
+                f'extra_kwargs.train_mode={inputs.extra_kwargs.get("train_mode")!r}, '
+                f'prefix_length={prefix_length!r})',
+                file=_sys.stderr, flush=True,
+            )
+            KimiK25NativeSFTTemplate._train_mode_logged = True
 
         # Compute which assistant ordinals are trainable.
         # StdTemplateInputs.from_dict() strips a leading system message out of
@@ -152,7 +207,7 @@ class KimiK25NativeSFTTemplate(Template):
         if prefix_length is not None:
             raw_prefix_length = prefix_length - (1 if inputs.system is not None else 0)
         else:
-            raw_prefix_length = 0
+            raw_prefix_length = None
         trainable_ordinals = compute_trainable_ordinals(
             raw_messages, raw_prefix_length, train_mode=train_mode,
         )
@@ -168,6 +223,29 @@ class KimiK25NativeSFTTemplate(Template):
 
         # Build labels: only suffix assistant spans are supervised
         labels = build_labels_for_ordinals(input_ids, trainable_ordinals, n_assistant)
+
+        # Debug: log label counts for first few rows so we can verify what the
+        # template produces vs what the trainer reports.
+        if KimiK25NativeSFTTemplate._label_debug_count < 8:
+            import os as _os, sys as _sys
+            rank = _os.environ.get('RANK', '?')
+            n_trained = sum(1 for l in labels if l != -100)
+            # Recompute marker here so we can verify compute_final_turn_marker output.
+            _marker = compute_final_turn_marker(raw_messages)
+            _tc_pattern = ''.join(
+                ('A' if m['role']=='assistant' and not m.get('tool_calls')
+                 else 'T' if m['role']=='assistant' else '.')
+                for m in raw_messages
+            )
+            print(
+                f'[kimi_k25_native_sft labels rank={rank}] '
+                f'n_trained={n_trained} n_total={len(labels)} '
+                f'trainable_ords={sorted(trainable_ordinals)} n_asst={n_assistant} '
+                f'train_mode={train_mode} pl={prefix_length} marker={_marker} '
+                f'pattern={_tc_pattern}',
+                file=_sys.stderr, flush=True,
+            )
+            KimiK25NativeSFTTemplate._label_debug_count += 1
 
         # Mask first token (ms-swift convention: first token never contributes to loss)
         if labels and labels[0] != -100:

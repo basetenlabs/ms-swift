@@ -990,7 +990,7 @@ class BaseMegatronTrainer(ABC):
                 print(f'[mem-profile] Sleeping to allow snapshot download. '
                       f'kubectl cp the snapshot, then kill the job.',
                       file=sys.stderr, flush=True)
-                time.sleep(120)  # 2 minutes
+                time.sleep(3600)  # 1 hour
             raise
 
         update_successful, grad_norm, _ = self.optimizer.step()
