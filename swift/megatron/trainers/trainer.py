@@ -137,6 +137,10 @@ class MegatronTrainer(BaseMegatronTrainer):
         labels = data.get('labels')
         if self.args.task_type == 'seq_cls':
             data.pop('labels', None)
+        if self.args.model_type == 'nemotron_h' and 'attention_mask' not in data:
+            # Megatron-Core's MambaModel.forward requires the attention_mask
+            # argument even though Nemotron-H/Mamba ignores it for this path.
+            data['attention_mask'] = None
         output_tensor = model(**data)
         packed_seq_params = data.get('packed_seq_params')
         if self.args.task_type == 'seq_cls':

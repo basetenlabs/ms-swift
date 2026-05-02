@@ -387,6 +387,9 @@ def _patch_TEGroupedLinear():
 
 
 def _patch_mtp():
+    import megatron.core
+    if version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0'):
+        return
     from megatron.core import InferenceParams
     from megatron.core.packed_seq_params import PackedSeqParams
     from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer

@@ -615,6 +615,7 @@ def _check_padding_free(args, config):
 
 def get_mcore_model_config(args, hf_config):
     kwargs = convert_hf_config(hf_config)
+    config_fields = {f.name for f in fields(MegatronModelConfig)}
     for f in fields(MegatronModelConfig):
         key, value = f.name, getattr(args, f.name, None)
         if value is None or isinstance(value, (list, tuple)) and len(value) == 0:
@@ -643,6 +644,11 @@ def get_mcore_model_config(args, hf_config):
     if num_moe_experts is None:
         kwargs['expert_model_parallel_size'] = 1
         kwargs['expert_tensor_parallel_size'] = 1
+    unsupported_keys = sorted(set(kwargs) - config_fields)
+    if unsupported_keys:
+        logger.warning(f'Dropping unsupported MegatronModelConfig kwargs: {unsupported_keys}')
+        for key in unsupported_keys:
+            kwargs.pop(key)
     config = MegatronModelConfig(**kwargs)
     config.hf_config = hf_config
     config.args = args

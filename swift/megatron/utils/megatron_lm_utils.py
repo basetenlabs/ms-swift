@@ -384,6 +384,82 @@ def _load_iteration(tracker_path: str):
     return iteration
 
 
+def _read_bridge_run_config_value(checkpoint_dir: str, key: str):
+    """Read a scalar value from Megatron-Bridge run_config.yaml if present.
+
+    Megatron-Bridge torch_dist exports may omit the legacy Megatron
+    ``common.pt['args']`` namespace that Megatron-SWIFT normally uses for
+    checkpoint TP/PP and save metadata. Bridge does persist those fields in
+    run_config.yaml, so read the few scalar values we need without depending on
+    the full config schema.
+    """
+    for filename in ('run_config.yaml', 'modelopt_run_config.yaml'):
+        path = os.path.join(checkpoint_dir, filename)
+        if not os.path.exists(path):
+            continue
+        with open(path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line.startswith(f'{key}:'):
+                    continue
+                value = line.split(':', 1)[1].strip()
+                if value in {'null', 'None', '~'}:
+                    return None
+                if value.lower() == 'true':
+                    return True
+                if value.lower() == 'false':
+                    return False
+                try:
+                    return int(value)
+                except ValueError:
+                    return value
+    return None
+
+
+def _read_bridge_train_state(load_dir: str, checkpoint_dir: str):
+    for path in [
+            os.path.join(checkpoint_dir, 'train_state.pt'),
+            os.path.join(load_dir, 'latest_train_state.pt'),
+    ]:
+        if not os.path.exists(path):
+            continue
+        try:
+            return torch.load(path, map_location='cpu')
+        except Exception as e:
+            logger.warning(f'Unable to read Megatron-Bridge train state `{path}`: {e}')
+    return {}
+
+
+def _get_checkpoint_args(args, load_dir: str, checkpoint_dir: str, state_dict: dict):
+    ckpt_args = state_dict.get('args')
+    if ckpt_args is not None:
+        return ckpt_args
+
+    def get_config_value(name, default):
+        value = _read_bridge_run_config_value(checkpoint_dir, name)
+        return default if value is None else value
+
+    train_state = _read_bridge_train_state(load_dir, checkpoint_dir)
+    consumed_train_samples = train_state.get('consumed_train_samples', 0)
+    if torch.is_tensor(consumed_train_samples):
+        consumed_train_samples = consumed_train_samples.item()
+
+    save_optim = get_config_value('save_optim', False)
+    save_rng = get_config_value('save_rng', False)
+    ckpt_args = Namespace(
+        tensor_model_parallel_size=get_config_value('tensor_model_parallel_size', args.tensor_model_parallel_size),
+        pipeline_model_parallel_size=get_config_value('pipeline_model_parallel_size',
+                                                      args.pipeline_model_parallel_size),
+        no_save_optim=not bool(save_optim),
+        no_save_rng=not bool(save_rng),
+        consumed_train_samples=consumed_train_samples,
+    )
+    state_dict['args'] = ckpt_args
+    logger.warning('Checkpoint common state has no `args`; inferred minimal checkpoint args from '
+                   f'Megatron-Bridge metadata/current run args: {ckpt_args}.')
+    return ckpt_args
+
+
 def load_mcore_checkpoint(args,
                           ddp_models: list,
                           optimizer=None,
@@ -409,10 +485,11 @@ def load_mcore_checkpoint(args,
     iteration = _load_iteration(tracker_path)
     checkpoint_dir = os.path.join(load_dir, f'iter_{iteration:07d}')
     state_dict = dist_checkpointing.load_common_state_dict(checkpoint_dir)
+    ckpt_args = _get_checkpoint_args(args, load_dir, checkpoint_dir, state_dict)
 
     ckpt_tp_pp = (
-        state_dict['args'].tensor_model_parallel_size,
-        state_dict['args'].pipeline_model_parallel_size,
+        ckpt_args.tensor_model_parallel_size,
+        ckpt_args.pipeline_model_parallel_size,
     )
     run_tp_pp = (
         args.tensor_model_parallel_size,
@@ -420,15 +497,14 @@ def load_mcore_checkpoint(args,
     )
     mismatch_msg = f'(TP, PP) mismatch after resume ({run_tp_pp} vs {ckpt_tp_pp} from checkpoint)'
     # Determine if RNG state will be loaded
-    if (ckpt_tp_pp == run_tp_pp and not finetune and not no_load_rng
-            and not getattr(state_dict['args'], 'no_save_rng', False)):
+    if ckpt_tp_pp == run_tp_pp and not finetune and not no_load_rng and not getattr(ckpt_args, 'no_save_rng', False):
         gen_sd_rng_state = _get_rng_state()  # we can load the rng state
     else:
         gen_sd_rng_state = None
         if ckpt_tp_pp != run_tp_pp:
             logger.info(f'{mismatch_msg}: RNG state will be ignored')
     sharded_sd_metadata = state_dict.get('content_metadata')
-    if (not finetune and not no_load_optim and not getattr(state_dict['args'], 'no_save_optim', False)):
+    if not finetune and not no_load_optim and not getattr(ckpt_args, 'no_save_optim', False):
         gen_sd_optim = optimizer
         gen_sd_opt_param_scheduler = opt_param_scheduler
 

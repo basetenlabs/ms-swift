@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import warnings
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import (TEColumnParallelGroupedLinear, TEColumnParallelLinear,
@@ -376,6 +377,16 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
             metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
         sharded_state_dict = tuners_sharded_state_dict(self, prefix, sharded_offsets, metadata)
+        base_layer_prefix = f'{prefix}base_layer.'
+        for k, v in list(sharded_state_dict.items()):
+            if not k.startswith(base_layer_prefix):
+                continue
+            alias_key = f'{prefix}{k[len(base_layer_prefix):]}'
+            if alias_key in sharded_state_dict:
+                continue
+            if hasattr(v, 'key'):
+                v = replace(v, key=v.key.replace('base_layer.', '', 1))
+            sharded_state_dict[alias_key] = v
         if prefix.endswith('linear_fc1.'):
             if isinstance(self.base_layer, TEGroupedLinear) and self.config.gated_linear_unit:
                 num_global_experts = (parallel_state.get_expert_model_parallel_world_size() * self.base_layer.num_gemms)
