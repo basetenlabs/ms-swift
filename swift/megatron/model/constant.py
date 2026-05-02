@@ -5,6 +5,7 @@ class LLMMegatronModelType:
     olmoe = 'olmoe'
     glm4 = 'glm4'
     minimax_m2 = 'minimax_m2'
+    nemotron_h = 'nemotron_h'
 
     qwen3_emb = 'qwen3_emb'
 

@@ -2,6 +2,7 @@
 import re
 import torch.nn.functional as F
 from dataclasses import dataclass, fields
+from megatron.core.activations import squared_relu
 from megatron.core import mpu
 from megatron.core.transformer import TransformerConfig
 from transformers.utils import is_torch_npu_available
@@ -194,6 +195,11 @@ class MegatronModelConfig(TransformerConfig):
     layernorm_zero_centered_gamma: bool = False
     attention_output_gate: bool = False
 
+    # Nemotron-H/Mamba hybrid models. Most Mamba fields live on
+    # TransformerConfig; the hybrid layer pattern is supplied to MambaModel
+    # separately, so keep it here for the Megatron-SWIFT loader.
+    hybrid_override_pattern: Optional[str] = None
+
     # dsa
     experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
     dsa_indexer_n_heads: Optional[int] = None
@@ -335,9 +341,17 @@ config_mapping = {
     'add_bias_linear': ['mlp_bias'],
     'kv_channels': ['head_dim'],
     'hf_model_type': ['model_type'],
+    # mamba/nemotron-h
+    'mamba_num_heads': ['mamba_num_heads'],
+    'mamba_head_dim': ['mamba_head_dim'],
+    'mamba_num_groups': ['n_groups'],
+    'mamba_state_dim': ['ssm_state_size'],
+    'hybrid_override_pattern': ['hybrid_override_pattern'],
+    'mtp_hybrid_override_pattern': ['mtp_hybrid_override_pattern'],
+    'mtp_num_layers': ['num_nextn_predict_layers'],
     # moe
     'moe_ffn_hidden_size': ['moe_intermediate_size'],
-    'moe_shared_expert_intermediate_size': ['shared_expert_intermediate_size'],
+    'moe_shared_expert_intermediate_size': ['moe_shared_expert_intermediate_size', 'shared_expert_intermediate_size'],
     'moe_router_topk': ['num_experts_per_tok', 'moe_topk', 'moe_k'],
     'moe_router_num_groups': ['n_group'],
     'moe_router_group_topk': ['topk_group'],
@@ -352,6 +366,7 @@ config_mapping = {
     'qk_pos_emb_head_dim': ['qk_rope_head_dim'],
     'v_head_dim': ['v_head_dim'],
     'moe_router_topk_scaling_factor': ['routed_scaling_factor'],
+    'moe_latent_size': ['moe_latent_size'],
     'qk_layernorm': ['use_qk_norm'],
     # qwen3_next/qwen3_5
     'linear_attention_freq': ['full_attention_interval'],
@@ -494,6 +509,41 @@ def convert_hf_config(config) -> Dict[str, Any]:
         res.setdefault('linear_attention_freq', 4)
     elif llm_model_type == 'minimax_m2':
         res['add_qkv_bias'] = False
+    elif llm_model_type == 'nemotron_h':
+        # Nemotron-H is a hybrid Mamba/attention/MoE architecture, not a GPT
+        # decoder stack. These defaults mirror NVIDIA's Megatron-Bridge
+        # Nemotron3SuperProvider closely enough for Megatron-SWIFT to build the
+        # same MCore module tree when loading a pre-converted torch_dist ckpt.
+        res['swiglu'] = False
+        res['gated_linear_unit'] = False
+        res['activation_func'] = squared_relu
+        res['use_fused_weighted_squared_relu'] = True
+        res['is_hybrid_model'] = True
+        res['position_embedding_type'] = 'none'
+        res['apply_rope_fusion'] = False
+        res['first_last_layers_bf16'] = True
+        res['attention_softmax_in_fp32'] = False
+        res['masked_softmax_fusion'] = True
+        res['apply_query_key_layer_scaling'] = False
+
+        res['moe_router_score_function'] = 'sigmoid'
+        res['moe_router_enable_expert_bias'] = True
+        res['moe_router_load_balancing_type'] = 'seq_aux_loss'
+        res['moe_router_dtype'] = 'fp32'
+        res['moe_grouped_gemm'] = True
+        res['moe_token_dispatcher_type'] = 'alltoall'
+        res['moe_shared_expert_overlap'] = getattr(config, 'moe_shared_expert_overlap', False)
+
+        # The HF config reports num_nextn_predict_layers=1, but the Super
+        # checkpoint contains mtp.layers.0 and mtp.layers.1 for the repeated
+        # MTP block. NVIDIA's recipe sets mtp_num_layers=2 and
+        # mtp_use_repeated_layer=True. For other Nemotron-H configs, falling
+        # back to len(pattern) preserves the MTP block depth.
+        mtp_pattern = res.get('mtp_hybrid_override_pattern')
+        if mtp_pattern:
+            res['mtp_num_layers'] = max(res.get('mtp_num_layers') or 0, len(mtp_pattern))
+        res['mtp_use_repeated_layer'] = True
+        res['keep_mtp_spec_in_bf16'] = True
     elif hf_model_type == 'llama4':
         qk_layernorm = res.pop('qk_layernorm', False)
         if qk_layernorm:
