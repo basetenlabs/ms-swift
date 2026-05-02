@@ -77,9 +77,22 @@ class MegatronTrainer(BaseMegatronTrainer):
         if args.context_parallel_size > 1 and not self.mcore_013:
             loss = all_reduce(loss, group=mpu.get_context_parallel_group())
 
-        # Reduce loss for logging.
+        # Reduce loss for logging.  With context parallelism, sparse label
+        # masks (for example last_round loss) can put all active labels on a
+        # different CP shard than the W&B/print rank.  Reduce over the
+        # data-parallel group including context-parallel ranks so the logged
+        # loss uses the same numerator/denominator as the CP-aware token stats
+        # below.
+        if dist.is_initialized():
+            try:
+                metric_reduce_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            except TypeError:
+                metric_reduce_group = mpu.get_data_parallel_group()
+        else:
+            metric_reduce_group = None
         reporting_loss = loss.detach().clone()
-        torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
+        if dist.is_initialized():
+            torch.distributed.all_reduce(reporting_loss, group=metric_reduce_group)
 
         lm_loss = loss[0]
         if not self.mcore_013:
@@ -94,11 +107,7 @@ class MegatronTrainer(BaseMegatronTrainer):
             torch.tensor(labels.numel(), dtype=torch.float32, device=labels.device),
         ])
         if dist.is_initialized():
-            try:
-                dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
-            except TypeError:
-                dp_group = mpu.get_data_parallel_group()
-            dist.all_reduce(token_stats, op=dist.ReduceOp.SUM, group=dp_group)
+            dist.all_reduce(token_stats, op=dist.ReduceOp.SUM, group=metric_reduce_group)
 
         metrics = {
             'loss': reporting_loss,
