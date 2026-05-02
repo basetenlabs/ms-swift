@@ -8,7 +8,7 @@ from tqdm import tqdm
 from typing import Optional
 
 from swift.template import MaxLengthError
-from swift.utils import get_logger, is_dist, is_master, split_list
+from swift.utils import get_logger, get_object_collective_group, is_dist, is_master, split_list
 
 logger = get_logger()
 
@@ -83,7 +83,7 @@ class PackingDataset(Dataset):
             self.packed_idx, self.packed_length = None, None
         if dist.is_initialized() and is_dist():
             obj_list = [(self.packed_idx, self.packed_length)]
-            dist.broadcast_object_list(obj_list)
+            dist.broadcast_object_list(obj_list, group=get_object_collective_group())
             self.packed_idx, self.packed_length = obj_list[0]
 
     def create_packed_idx(self, rank, offset, lengths):

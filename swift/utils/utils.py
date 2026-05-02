@@ -30,6 +30,38 @@ from .np_utils import stat_array
 
 logger = get_logger()
 
+_OBJECT_COLLECTIVE_PROCESS_GROUPS = {}
+
+
+def get_object_collective_group():
+    """Return an optional process group for Python-object collectives.
+
+    PyTorch object collectives use the process group's backend.  On large
+    multi-node NCCL jobs we have seen small control-plane object collectives
+    (for example ``broadcast_object_list`` while choosing the output version)
+    fail during NCCL connection setup before training starts.  Jobs can set
+    ``SWIFT_OBJECT_COLLECTIVE_BACKEND=gloo`` to route these control-plane
+    collectives through a Gloo group while leaving tensor collectives on NCCL.
+    """
+    if not dist.is_available() or not dist.is_initialized():
+        return None
+
+    backend = os.environ.get('SWIFT_OBJECT_COLLECTIVE_BACKEND', '').strip().lower()
+    if backend in {'', 'default', 'none', 'nccl'}:
+        return None
+    if backend != 'gloo':
+        raise ValueError(f"Unsupported SWIFT_OBJECT_COLLECTIVE_BACKEND={backend!r}; "
+                         "expected 'gloo' or 'default'.")
+
+    key = (backend, dist.get_world_size())
+    if key not in _OBJECT_COLLECTIVE_PROCESS_GROUPS:
+        timeout = dt.timedelta(seconds=int(os.environ.get('SWIFT_OBJECT_COLLECTIVE_TIMEOUT', '18000000')))
+        _OBJECT_COLLECTIVE_PROCESS_GROUPS[key] = dist.new_group(backend=backend, timeout=timeout)
+        if is_master():
+            logger.info('Using a Gloo process group for Swift object collectives '
+                        '(SWIFT_OBJECT_COLLECTIVE_BACKEND=gloo).')
+    return _OBJECT_COLLECTIVE_PROCESS_GROUPS[key]
+
 
 def check_json_format(obj: Any, token_safe: bool = True) -> Any:
     if obj is None or isinstance(obj, (int, float, str, complex)):  # bool is a subclass of int
@@ -132,7 +164,7 @@ def add_version_to_work_dir(work_dir: str) -> str:
     sub_folder = f'v{version}-{time}'
     if dist.is_initialized() and is_dist():
         obj_list = [sub_folder]
-        dist.broadcast_object_list(obj_list)
+        dist.broadcast_object_list(obj_list, group=get_object_collective_group())
         sub_folder = obj_list[0]
 
     work_dir = os.path.join(work_dir, sub_folder)

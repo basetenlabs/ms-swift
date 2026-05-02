@@ -38,7 +38,8 @@ from swift.megatron.utils import (copy_original_module_weight, disable_forward_p
 from swift.template import Template
 from swift.trainers import dynamic_gradient_checkpointing
 from swift.trainers.utils import patch_modelscope_hub_timeout
-from swift.utils import deep_getattr, get_last_valid_indices, get_logger, is_last_rank, is_master, ms_logger_context
+from swift.utils import (deep_getattr, get_last_valid_indices, get_logger, get_object_collective_group, is_last_rank,
+                         is_master, ms_logger_context)
 from .batch_sampler import MegatronPretrainingRandomSampler, MegatronPretrainingSampler
 from .utils import (TrainerState, build_streaming_dataloader, get_batch_on_this_cp_rank, get_batch_on_this_pp_rank,
                     get_packed_seq_params)
@@ -440,7 +441,7 @@ class BaseMegatronTrainer(ABC):
         # runtime error when loading the checkpoint or numerical error when resuming training.
         params_key = list(params_map.keys())
         gathered_params_key = [None for _ in range(torch.distributed.get_world_size())]
-        torch.distributed.all_gather_object(gathered_params_key, params_key)
+        torch.distributed.all_gather_object(gathered_params_key, params_key, group=get_object_collective_group())
         for keys in gathered_params_key:
             for key in keys:
                 if key not in params_key:

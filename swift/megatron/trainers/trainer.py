@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import os
 import torch
 import torch.distributed as dist
 import torch.nn
@@ -13,6 +14,15 @@ from swift.utils import get_logger
 from .base import BaseMegatronTrainer
 
 logger = get_logger()
+
+
+def _get_object_data_parallel_group():
+    if os.environ.get('SWIFT_OBJECT_COLLECTIVE_BACKEND', '').strip().lower() == 'gloo':
+        try:
+            return mpu.get_data_parallel_group_gloo()
+        except Exception:
+            pass
+    return mpu.get_data_parallel_group()
 
 
 class MegatronTrainer(BaseMegatronTrainer):
@@ -121,7 +131,7 @@ class MegatronTrainer(BaseMegatronTrainer):
 
         # Synchronize keys to avoid getting stuck.
         all_keys = [None] * mpu.get_data_parallel_world_size()
-        dist.all_gather_object(all_keys, list(metrics.keys()), group=mpu.get_data_parallel_group())
+        dist.all_gather_object(all_keys, list(metrics.keys()), group=_get_object_data_parallel_group())
         new_metrics = {}
         for key in sorted(set().union(*all_keys)):
             new_metrics[key] = metrics[key]
