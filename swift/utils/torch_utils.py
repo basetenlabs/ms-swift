@@ -46,6 +46,17 @@ def time_synchronize() -> float:
 _DISABLE_USE_BARRIER = False
 
 
+def _get_safe_ddp_barrier_group():
+    """Return an optional control-plane group for safe_ddp_context barriers."""
+    if os.environ.get('SWIFT_OBJECT_COLLECTIVE_BACKEND', '').strip().lower() != 'gloo':
+        return None
+
+    # Import lazily to avoid a module-import cycle with swift.utils.__init__.
+    from .utils import get_object_collective_group
+
+    return get_object_collective_group()
+
+
 @contextmanager
 def disable_safe_ddp_context_use_barrier():
     global _DISABLE_USE_BARRIER
@@ -61,19 +72,20 @@ def safe_ddp_context(hash_id: Optional[str], use_barrier: bool = True):
     if _DISABLE_USE_BARRIER:
         use_barrier = False
     if use_barrier and dist.is_initialized():
+        barrier_group = _get_safe_ddp_barrier_group()
         if is_dist():
             if not is_master():
-                dist.barrier()
+                dist.barrier(group=barrier_group)
             if not is_local_master():
                 # Compatible with multi-machine scenarios,
                 # where each machine uses different storage hardware.
-                dist.barrier()
+                dist.barrier(group=barrier_group)
         yield
         if is_dist():
             if is_master():
-                dist.barrier()
+                dist.barrier(group=barrier_group)
             if is_local_master():
-                dist.barrier()
+                dist.barrier(group=barrier_group)
     elif hash_id is not None:
         lock_dir = os.path.join(get_cache_dir(), 'lockers')
         os.makedirs(lock_dir, exist_ok=True)
