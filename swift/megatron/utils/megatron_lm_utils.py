@@ -35,6 +35,91 @@ logger = get_logger()
 
 mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 
+_DCP_LOAD_PROCESS_GROUPS = {}
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {'0', 'false', 'no', 'off', ''}
+
+
+def _get_dcp_load_process_group(args):
+    """Return an optional process group for torch.distributed.checkpoint load planning.
+
+    PyTorch DCP's deprecated ``load_state_dict`` coordinates load plans using
+    object collectives.  With a NCCL default process group those object
+    collectives are serialized into CUDA tensors and can fail on large
+    multi-node checkpoints with opaque ``NCCL Error 3`` failures during
+    ``scatter_object_list``.  Nemotron-H checkpoints have hit this consistently
+    on 16-rank launches, so default their DCP control-plane collectives to a
+    Gloo group while keeping the normal training process group as NCCL.
+
+    Override with:
+      - SWIFT_MCORE_DCP_LOAD_BACKEND=default|none|nccl to keep current behavior
+      - SWIFT_MCORE_DCP_LOAD_BACKEND=gloo to force Gloo coordination
+    """
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return None
+
+    default_backend = 'gloo' if getattr(args, 'model_type', None) == 'nemotron_h' else 'default'
+    backend = os.environ.get('SWIFT_MCORE_DCP_LOAD_BACKEND', default_backend).strip().lower()
+    if backend in {'', 'default', 'none', 'nccl'}:
+        return None
+    if backend != 'gloo':
+        raise ValueError(f"Unsupported SWIFT_MCORE_DCP_LOAD_BACKEND={backend!r}; expected 'gloo' or 'default'.")
+
+    key = (backend, torch.distributed.get_world_size())
+    if key not in _DCP_LOAD_PROCESS_GROUPS:
+        timeout = timedelta(seconds=getattr(args, 'ddp_timeout', 18000000))
+        _DCP_LOAD_PROCESS_GROUPS[key] = torch.distributed.new_group(backend=backend, timeout=timeout)
+        if is_master():
+            logger.info('Using a Gloo process group for torch.distributed.checkpoint load planning '
+                        '(SWIFT_MCORE_DCP_LOAD_BACKEND=gloo).')
+    return _DCP_LOAD_PROCESS_GROUPS[key]
+
+
+def _use_fully_parallel_checkpoint_load(args, dcp_process_group) -> bool:
+    """Whether to wrap MCore checkpoint loading in FullyParallelLoadStrategyWrapper."""
+    default = True
+    if getattr(args, 'model_type', None) == 'nemotron_h' and dcp_process_group is not None:
+        # Avoid the wrapper's additional object collectives for Nemotron-H by
+        # default. Exact-topology Nemotron loads are more reliable if each rank
+        # lets PyTorch DCP load its own shard directly through the Gloo control
+        # process group.
+        default = False
+    return _env_flag('SWIFT_MCORE_FULLY_PARALLEL_LOAD', default)
+
+
+@contextmanager
+def _patch_dcp_load_state_dict_process_group(process_group):
+    """Temporarily inject ``process_group`` into torch.distributed.checkpoint.load_state_dict.
+
+    Megatron-Core's TorchDistLoadShardedStrategy calls the deprecated
+    ``torch.distributed.checkpoint.load_state_dict`` without a process_group
+    parameter.  Rather than patching Megatron-Core itself, patch the module
+    function around the checkpoint load call so the DCP planning collectives use
+    the control-plane group selected above.
+    """
+    if process_group is None:
+        yield
+        return
+
+    from torch.distributed import checkpoint as torch_dist_checkpoint
+
+    original_load_state_dict = torch_dist_checkpoint.load_state_dict
+
+    def load_state_dict_with_process_group(*args, **kwargs):
+        kwargs.setdefault('process_group', process_group)
+        return original_load_state_dict(*args, **kwargs)
+
+    torch_dist_checkpoint.load_state_dict = load_state_dict_with_process_group
+    try:
+        yield
+    finally:
+        torch_dist_checkpoint.load_state_dict = original_load_state_dict
+
 
 @contextmanager
 def _patch_megatron_timeout(distributed_timeout_minutes):
@@ -533,10 +618,16 @@ def load_mcore_checkpoint(args,
     model_keys = [k for k in sharded_state_dict.keys() if k.startswith('model')]  # compat vpp
     for k in model_keys:
         patch_merge_fn(sharded_state_dict[k])
+    dcp_process_group = _get_dcp_load_process_group(args)
     load_strategy = get_default_load_sharded_strategy(checkpoint_dir)
-    load_strategy = FullyParallelLoadStrategyWrapper(load_strategy,
-                                                     mpu.get_data_parallel_group(with_context_parallel=True))
-    state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_dir, load_strategy)
+    if _use_fully_parallel_checkpoint_load(args, dcp_process_group):
+        load_strategy = FullyParallelLoadStrategyWrapper(load_strategy,
+                                                         mpu.get_data_parallel_group(with_context_parallel=True))
+    elif is_master():
+        logger.info('Loading MCore checkpoint without FullyParallelLoadStrategyWrapper '
+                    '(SWIFT_MCORE_FULLY_PARALLEL_LOAD=0).')
+    with _patch_dcp_load_state_dict_process_group(dcp_process_group):
+        state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_dir, load_strategy)
 
     if finetune:
         iteration = 0
