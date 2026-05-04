@@ -23,6 +23,27 @@ mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0
 logger = get_logger()
 
 
+def _pipeline_stage_needs_input_ids(args) -> bool:
+    """Return whether non-first PP stages must keep token ids in the batch.
+
+    Standard GPT-style PP only needs ``input_ids`` on the first pipeline stage
+    because later stages receive hidden states from the schedule.  MTP is the
+    exception: the final MTP-owning stage re-embeds shifted ``input_ids`` to
+    build the MTP decoder input.  ms-swift's generic guard keys off
+    ``args.mtp_num_layers``, but Nemotron-H gets MTP from its hybrid Mamba layer
+    pattern and that value can still be absent on ``args`` even though the
+    built MambaModel has ``mtp_process=True``.  Dropping ``input_ids`` in that
+    case crashes first forward with:
+
+      AttributeError: 'NoneType' object has no attribute 'clone'
+
+    in Megatron-Core's packed-sequence MTP roll.
+    """
+    if getattr(args, 'mtp_num_layers', None):
+        return True
+    return getattr(args, 'model_type', None) == 'nemotron_h'
+
+
 def get_batch_on_this_pp_rank(args, data, vp_stage=None):
     if args.task_type == 'causal_lm':
         data['labels'] = torch.roll(data['labels'], -1, dims=-1)
@@ -37,7 +58,7 @@ def get_batch_on_this_pp_rank(args, data, vp_stage=None):
     else:
         is_pp_first_stage = mpu.is_pipeline_first_stage()
         is_pp_last_stage = mpu.is_pipeline_last_stage()
-    if not args.mtp_num_layers and not is_pp_first_stage:
+    if not _pipeline_stage_needs_input_ids(args) and not is_pp_first_stage:
         batch['input_ids'] = None
     if not is_pp_last_stage:
         batch['labels'] = None
