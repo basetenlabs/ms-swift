@@ -1,7 +1,25 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import os
 import torch
 from megatron.core import mpu
 from typing import Optional
+
+
+def _skip_model_parallel_stat_reduce() -> bool:
+    """Skip tiny model-parallel status/stat reductions when requested.
+
+    Nemotron-H multinode smoke runs have repeatedly wedged in scalar NCCL
+    control-plane reductions after the first optimizer step, even after the
+    real tensor work completed. These reductions only synchronize logging and
+    update-success metadata, so allowing an opt-out is a pragmatic way to keep
+    the training loop moving while the deeper NCCL/group issue is investigated.
+    """
+    return os.environ.get('SWIFT_SKIP_MP_STAT_REDUCE', '').strip().lower() in {
+        '1',
+        'true',
+        'yes',
+        'on',
+    }
 
 
 def reduce_max_stat_across_model_parallel_group(stat: float) -> float:
@@ -12,6 +30,8 @@ def reduce_max_stat_across_model_parallel_group(stat: float) -> float:
 
     We use an all_reduce max since the values have already been summed across optimizer ranks where possible
     """
+    if _skip_model_parallel_stat_reduce():
+        return stat
     stat = torch.tensor([stat], dtype=torch.float32, device=torch.cuda.current_device())
     torch.distributed.all_reduce(stat, op=torch.distributed.ReduceOp.MAX, group=mpu.get_model_parallel_group())
     return stat.item()
@@ -21,6 +41,8 @@ def logical_and_across_model_parallel_group(input: bool) -> bool:
     """
     This function gathers a bool value across the model parallel group
     """
+    if _skip_model_parallel_stat_reduce():
+        return input
     input = int(bool(input))
     input = torch.tensor([input], dtype=torch.int, device=torch.cuda.current_device())
     torch.distributed.all_reduce(input, op=torch.distributed.ReduceOp.MIN, group=mpu.get_model_parallel_group())
