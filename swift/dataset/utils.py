@@ -142,7 +142,16 @@ class SequentialSkipLazyLLMDataset(LazyLLMDataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         if isinstance(idx, str):
-            return self.dataset[idx]
+            values = self.dataset[idx]
+            if self.randomize_dataset:
+                # Numeric indexing below maps logical index -> self._idx_order[index].
+                # Keep column-style access aligned with that mapping too.  PackingDataset
+                # consumes `dataset['lengths']` to build bins and then later consumes
+                # `dataset[i]` to fetch the encoded rows; if the column is left in the
+                # original order while rows are randomized, bins are computed from one set
+                # of examples and materialized from another.
+                return [values[i] for i in self._idx_order]
+            return values
         dataset_len = len(self.dataset)
         start_pos = idx % dataset_len
         offset = 0

@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
 import multiprocessing as mp
+import os
 import torch.distributed as dist
 from itertools import chain
 from torch.utils.data import Dataset, IterableDataset
@@ -101,9 +102,92 @@ class PackingDataset(Dataset):
             self._out_queue.put((rank, sequences, len(new_data)))
         self._out_queue.put((rank, [], -1))
 
+    @staticmethod
+    def _actual_row_length(row):
+        lengths = []
+        for key in ('input_ids', 'labels'):
+            value = row.get(key)
+            if value is not None:
+                lengths.append(len(value))
+        if not lengths and row.get('length') is not None:
+            length = row['length']
+            if isinstance(length, (list, tuple)):
+                lengths.append(max(length) if length else 0)
+            else:
+                lengths.append(length)
+        return max(lengths) if lengths else 0
+
+    @staticmethod
+    def _slice_row_value(value, length, key):
+        if value is None:
+            return value
+        if hasattr(value, 'dim'):
+            if key == 'position_ids' and value.dim() == 3:
+                return value[..., :length]
+            return value[:length]
+        if isinstance(value, tuple):
+            return value[:length]
+        if isinstance(value, list):
+            return value[:length]
+        return value
+
+    def _truncate_materialized_row(self, row, length):
+        row = dict(row)
+        for key in ('input_ids', 'labels', 'loss_scale', 'position_ids'):
+            if key in row:
+                row[key] = self._slice_row_value(row[key], length, key)
+        row['length'] = min(self._actual_row_length(row), length)
+        if 'lengths' in row:
+            row['lengths'] = [row['length']]
+        return row
+
+    def _cap_materialized_rows(self, row, index, sequence):
+        """Ensure materialized packed rows do not exceed the configured cap.
+
+        Packing bins are planned from cached per-row lengths and then rows are
+        lazily encoded in __getitem__. If those two views ever diverge (for
+        example, due to a randomized lazy wrapper), the collator can otherwise
+        concatenate a batch longer than packing_length/max_length. Dropping tail
+        rows here is preferable to handing an overlong packed sequence to
+        Megatron, where it can hang inside the model/pipeline schedule.
+        """
+        if not self.packing_length or not row:
+            return row
+
+        lengths = [self._actual_row_length(r) for r in row]
+        total = sum(lengths)
+        if total <= self.packing_length:
+            return row
+
+        kept, kept_length = [], 0
+        for r, length in zip(row, lengths):
+            if length > self.packing_length:
+                r = self._truncate_materialized_row(r, self.packing_length)
+                length = self._actual_row_length(r)
+            if kept and kept_length + length > self.packing_length:
+                continue
+            kept.append(r)
+            kept_length += length
+            if kept_length >= self.packing_length:
+                break
+
+        if os.environ.get('SWIFT_DEBUG_PACKING'):
+            planned_length = None
+            if self.packed_length is not None and index < len(self.packed_length):
+                planned_length = self.packed_length[index]
+            logger.warning(
+                'Materialized packed sample exceeded packing_length; '
+                f'index={index}, sequence={sequence}, planned_length={planned_length}, '
+                f'actual_lengths={lengths}, actual_total={total}, '
+                f'kept_count={len(kept)}, kept_total={kept_length}, '
+                f'packing_length={self.packing_length}.')
+
+        return kept or row[:1]
+
     def __getitem__(self, index):
         sequence = self.packed_idx[index]
         row = [self.dataset[i] for i in sequence]
+        row = self._cap_materialized_rows(row, index, sequence)
         return row
 
     def __len__(self):
