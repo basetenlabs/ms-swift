@@ -7,6 +7,7 @@ import os
 import shutil
 import time
 import torch
+import torch.distributed as dist
 import torch.nn
 from abc import ABC, abstractmethod
 from contextlib import contextmanager, nullcontext
@@ -118,6 +119,36 @@ class BaseMegatronTrainer(ABC):
     def call_event(self, event, **kwargs):
         for callback in self.callbacks:
             getattr(callback, event)(**kwargs)
+
+    def _debug_train_loop(self, message: str, **kwargs):
+        if os.environ.get('SWIFT_DEBUG_TRAIN_LOOP', '').strip().lower() not in {'1', 'true', 'yes', 'on'}:
+            return
+        try:
+            rank = dist.get_rank() if dist.is_initialized() else int(os.environ.get('RANK', -1))
+        except Exception:
+            rank = os.environ.get('RANK', '?')
+        local_rank = os.environ.get('LOCAL_RANK', '?')
+        parts = [f'[SWIFT_DEBUG_TRAIN_LOOP rank={rank} local_rank={local_rank}']
+        try:
+            parts.append(f'tp={mpu.get_tensor_model_parallel_rank()}')
+            parts.append(f'pp={mpu.get_pipeline_model_parallel_rank()}')
+            parts.append(f'dp={mpu.get_data_parallel_rank()}')
+            parts.append(f'ep={mpu.get_expert_model_parallel_rank()}')
+        except Exception:
+            pass
+        parts.append(f'iter={getattr(self.state, "iteration", "?")}]')
+        parts.append(message)
+        for key, value in kwargs.items():
+            try:
+                if isinstance(value, torch.Tensor):
+                    if value.numel() == 1:
+                        value = value.item()
+                    else:
+                        value = f'tensor(shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device})'
+            except Exception:
+                pass
+            parts.append(f'{key}={value}')
+        print(' '.join(str(p) for p in parts), flush=True)
 
     def on_log(self, logs, prefix=''):
         # n_steps is populated by _aggregated_metrics which only runs on the last PP rank.
@@ -659,9 +690,19 @@ class BaseMegatronTrainer(ABC):
         else:
             train_data_iterator, val_data_iterator = self._prepare_data_iterator(train_dataset, val_dataset)
         while state.iteration < args.train_iters:
+            self._debug_train_loop('loop_begin', train_iters=args.train_iters)
             self.call_event('on_step_begin')
+            self._debug_train_loop('after_on_step_begin')
+            self._debug_train_loop('before_maybe_finalize_async_save')
             maybe_finalize_async_save(args, blocking=False)
+            self._debug_train_loop('after_maybe_finalize_async_save')
+            self._debug_train_loop('before_train_step')
             metrics, grad_norm, update_successful = self.train_step(train_data_iterator)
+            self._debug_train_loop(
+                'after_train_step',
+                metrics_len=len(metrics) if metrics is not None else None,
+                grad_norm=grad_norm,
+                update_successful=update_successful)
             if state.iteration == start_iteration:
                 if update_successful:
                     # Enable forward pre-hook after training step has successfully run. All subsequent
@@ -675,8 +716,12 @@ class BaseMegatronTrainer(ABC):
                     start_iteration = state.iteration + 1
 
             state.iteration += 1
+            self._debug_train_loop('after_iteration_increment')
             self.call_event('on_step_end')
+            self._debug_train_loop('after_on_step_end')
+            self._debug_train_loop('before_aggregated_metrics')
             self._aggregated_metrics(metrics, train_metrics)
+            self._debug_train_loop('after_aggregated_metrics', train_metric_keys=sorted(train_metrics.keys()))
             train_metrics['grad_norm'] = grad_norm
             learning_rate = None
             for param_group in self.optimizer.param_groups:
@@ -687,16 +732,20 @@ class BaseMegatronTrainer(ABC):
                 train_metrics['learning_rate'] = learning_rate
             if state.should_log:
                 state.should_log = False
+                self._debug_train_loop('before_on_log', train_metric_keys=sorted(train_metrics.keys()))
                 self.on_log(logs=train_metrics)
+                self._debug_train_loop('after_on_log')
                 train_metrics = {}
 
             eval_metrics = None
             if state.should_eval:
                 state.should_eval = False
+                self._debug_train_loop('before_evaluate')
                 if should_disable_forward_pre_hook(args):
                     disable_forward_pre_hook(self.wrapped_models)
                     pre_hook_enabled = False
                 eval_metrics = self.evaluate(val_data_iterator)
+                self._debug_train_loop('after_evaluate')
                 for m in self.wrapped_models:
                     m.train()
                 if should_disable_forward_pre_hook(args):
@@ -708,7 +757,9 @@ class BaseMegatronTrainer(ABC):
                 if should_disable_forward_pre_hook(args):
                     disable_forward_pre_hook(self.wrapped_models)
                 state.should_save = False
+                self._debug_train_loop('before_save_checkpoint')
                 self.save_checkpoint()
+                self._debug_train_loop('after_save_checkpoint')
                 self.call_event('on_save', output_dir=self.state.last_model_checkpoint)
                 if should_disable_forward_pre_hook(args):
                     enable_forward_pre_hook(self.wrapped_models)
@@ -874,11 +925,17 @@ class BaseMegatronTrainer(ABC):
     def train_step(self, train_data_iterator):
         args = self.args
         forward_backward_func = get_forward_backward_func()
+        self._debug_train_loop('train_step_begin')
         for m in self.wrapped_models:
             m.zero_grad_buffer()
+        self._debug_train_loop('after_zero_grad_buffer')
         self.optimizer.zero_grad()
+        self._debug_train_loop('after_optimizer_zero_grad')
         # TODO: refactor _replace_data_iterator
+        self._debug_train_loop('before_replace_data_iterator')
         data_iterator = self._replace_data_iterator(train_data_iterator)
+        self._debug_train_loop('after_replace_data_iterator')
+        self._debug_train_loop('before_forward_backward')
         metrics = forward_backward_func(
             forward_step_func=self.forward_step,
             data_iterator=data_iterator,
@@ -888,13 +945,23 @@ class BaseMegatronTrainer(ABC):
             micro_batch_size=args.micro_batch_size,
             forward_only=False,
         )
+        self._debug_train_loop('after_forward_backward', metrics_len=len(metrics) if metrics is not None else None)
 
+        self._debug_train_loop('before_optimizer_step')
         update_successful, grad_norm, _ = self.optimizer.step()
+        self._debug_train_loop('after_optimizer_step', update_successful=update_successful, grad_norm=grad_norm)
+        self._debug_train_loop('before_logical_and_across_model_parallel_group')
         update_successful = logical_and_across_model_parallel_group(update_successful)
+        self._debug_train_loop('after_logical_and_across_model_parallel_group', update_successful=update_successful)
+        self._debug_train_loop('before_reduce_max_stat_across_model_parallel_group')
         grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
+        self._debug_train_loop('after_reduce_max_stat_across_model_parallel_group', grad_norm=grad_norm)
         if update_successful:
+            self._debug_train_loop('before_scheduler_step')
             self.opt_param_scheduler.step(increment=args.global_batch_size)
+            self._debug_train_loop('after_scheduler_step')
 
+        self._debug_train_loop('train_step_end', update_successful=update_successful, grad_norm=grad_norm)
         return metrics, grad_norm, update_successful
 
     def _aggregated_metrics(self, metrics, total_metrics):
