@@ -65,6 +65,12 @@ class MegatronTrainer(BaseMegatronTrainer):
                   channels: Optional[List[str]] = None,
                   packed_seq_params=None):
         args = self.args
+        self._debug_train_loop(
+            'loss_func_begin',
+            output_shape=tuple(output_tensor.shape) if hasattr(output_tensor, 'shape') else None,
+            labels_shape=tuple(labels.shape) if hasattr(labels, 'shape') else None,
+            has_loss_scale=loss_scale is not None,
+            has_packed_seq_params=packed_seq_params is not None)
 
         losses = output_tensor.float()
         loss_mask = labels != -100
@@ -92,7 +98,9 @@ class MegatronTrainer(BaseMegatronTrainer):
             metric_reduce_group = None
         reporting_loss = loss.detach().clone()
         if dist.is_initialized():
+            self._debug_train_loop('loss_func_before_reporting_loss_all_reduce')
             torch.distributed.all_reduce(reporting_loss, group=metric_reduce_group)
+            self._debug_train_loop('loss_func_after_reporting_loss_all_reduce')
 
         lm_loss = loss[0]
         if not self.mcore_013:
@@ -107,7 +115,9 @@ class MegatronTrainer(BaseMegatronTrainer):
             torch.tensor(labels.numel(), dtype=torch.float32, device=labels.device),
         ])
         if dist.is_initialized():
+            self._debug_train_loop('loss_func_before_token_stats_all_reduce')
             dist.all_reduce(token_stats, op=dist.ReduceOp.SUM, group=metric_reduce_group)
+            self._debug_train_loop('loss_func_after_token_stats_all_reduce')
 
         metrics = {
             'loss': reporting_loss,
@@ -117,6 +127,7 @@ class MegatronTrainer(BaseMegatronTrainer):
         }
         if args.enable_channel_loss and channels is not None:
             metrics.update(self._compute_channel_loss(losses, loss_mask, channels, packed_seq_params))
+        self._debug_train_loop('loss_func_end')
         return (lm_loss, local_num_tokens, metrics)
 
     def _compute_channel_loss(self, losses, loss_mask, channels, packed_seq_params=None):
@@ -150,7 +161,15 @@ class MegatronTrainer(BaseMegatronTrainer):
     def forward_step(self, data_iterator, model):
         # Get the batch.
         vp_stage = model.module.module.vp_stage
+        self._debug_train_loop('forward_step_begin', vp_stage=vp_stage)
         data = self.get_batch(data_iterator, vp_stage)
+        batch_summary = {}
+        for key, value in data.items():
+            if isinstance(value, torch.Tensor):
+                batch_summary[key] = f'shape={tuple(value.shape)},dtype={value.dtype},device={value.device}'
+            else:
+                batch_summary[key] = type(value).__name__
+        self._debug_train_loop('forward_step_after_get_batch', batch=batch_summary)
         loss_scale = data.pop('loss_scale', None)
         channels = data.pop('channel', None)
         labels = data.get('labels')
@@ -160,7 +179,11 @@ class MegatronTrainer(BaseMegatronTrainer):
             # Megatron-Core's MambaModel.forward requires the attention_mask
             # argument even though Nemotron-H/Mamba ignores it for this path.
             data['attention_mask'] = None
+        self._debug_train_loop('forward_step_before_model_forward', data_keys=sorted(data.keys()))
         output_tensor = model(**data)
+        self._debug_train_loop(
+            'forward_step_after_model_forward',
+            output_shape=tuple(output_tensor.shape) if hasattr(output_tensor, 'shape') else None)
         packed_seq_params = data.get('packed_seq_params')
         if self.args.task_type == 'seq_cls':
             loss_func = partial(
@@ -175,4 +198,5 @@ class MegatronTrainer(BaseMegatronTrainer):
                 loss_scale=loss_scale,
                 channels=channels,
                 packed_seq_params=packed_seq_params)
+        self._debug_train_loop('forward_step_end')
         return output_tensor, loss_func
