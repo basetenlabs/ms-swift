@@ -1120,8 +1120,20 @@ class Template(ProcessorMixin):
                 # where tool_content is a List.
                 messages[i_start:i + 1] = [{'role': 'tool', 'content': tool_content}]
                 i = i_start + 1
-            elif pre_role == 'assistant' and role == 'assistant' or pre_role == 'user' and role == 'user':
-                # Consecutive messages from the assistant/user role need to be merged to prevent errors.
+            elif pre_role == 'assistant' and role == 'assistant':
+                if self.is_training and strtobool(os.environ.get('SWIFT_PRESERVE_CONSECUTIVE_ASSISTANT', 'false')):
+                    # Keep consecutive assistant messages as separate turns for last_round masking.
+                    # The swift encoder is pair-based (user/tool -> assistant), so insert a
+                    # zero-content user delimiter instead of concatenating the two assistant
+                    # contents and losing the loss boundary.
+                    messages.insert(i, {'role': 'user', 'content': ''})
+                    i += 2
+                else:
+                    # Consecutive messages from the assistant role historically merged to prevent errors.
+                    pre_message['content'] = pre_content + content
+                    messages.pop(i)
+            elif pre_role == 'user' and role == 'user':
+                # Consecutive messages from the user role need to be merged to prevent errors.
                 pre_message['content'] = pre_content + content
                 messages.pop(i)
             else:
